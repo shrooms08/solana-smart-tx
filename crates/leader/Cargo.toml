@@ -1,0 +1,24 @@
+[package]
+name = "leader"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+stream = { workspace = true }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+# Plan B leader detection: solana-client RPC for the schedule, reqwest for the
+# Jito validator set (kobe.mainnet.jito.network).
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The leader_probe example wires stream + tracker against live infra.
+dotenvy = { workspace = true }
+tracing-subscriber = { workspace = true }

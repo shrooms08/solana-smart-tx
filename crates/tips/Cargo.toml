@@ -1,0 +1,30 @@
+[package]
+name = "tips"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# WebSocket client for the Jito tip_stream feed. rustls only (no native-tls),
+# webpki roots so we don't depend on the system trust store.
+tokio-tungstenite = { version = "0.28", default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+# Used only to install a process-default rustls CryptoProvider (ring) for the
+# tokio-tungstenite handshake.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# Jitter for the reconnect backoff (same pattern as the stream crate).
+rand = "0.8"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

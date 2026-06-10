@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/stream",
+    "crates/leader",
+    "crates/tips",
+    "crates/submitter",
+    "crates/lifecycle",
+    "crates/failure",
+    "crates/agent",
+    "crates/orchestrator",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+# ---------------------------------------------------------------------------
+# Pinned, workspace-wide dependency versions.
+# Resolved 2026-06-09 against the latest mutually compatible releases:
+#   - yellowstone-grpc v13.2.2 is the latest stable tag built on Solana 4.0.x
+#   - jito-sdk-rust (jito-rust-rpc) v0.3.2 carries no direct solana-sdk dep
+#   - solana-sdk 4.0.1 / solana-client 4.0.0 line up with the Agave 4.0 crates
+#     that yellowstone-grpc-proto pulls in.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# Yellowstone gRPC (Dragon's Mouth) — github.com/rpcpool/yellowstone-grpc
+yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", tag = "v13.2.2+solana.4.0.0" }
+yellowstone-grpc-proto  = { git = "https://github.com/rpcpool/yellowstone-grpc", tag = "v13.2.2+solana.4.0.0" }
+
+# Jito JSON-RPC SDK — github.com/jito-labs/jito-rust-rpc
+jito-sdk-rust = { git = "https://github.com/jito-labs/jito-rust-rpc", tag = "v0.3.2" }
+
+# Solana
+solana-sdk    = "4.0.1"
+solana-client = "4.0.0"
+
+# Async runtime
+tokio = { version = "1.47", features = ["full"] }
+
+# Persistence
+# sqlx 0.9 split the old `runtime-tokio-rustls` combo into separate
+# runtime (`runtime-tokio`) + TLS (`tls-rustls`) features.
+sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio", "tls-rustls", "macros", "migrate"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Observability
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Errors
+anyhow    = "1.0"
+thiserror = "2.0"
+
+# Config
+dotenvy = "0.15"
+
+# Internal crates
+stream    = { path = "crates/stream" }
+leader    = { path = "crates/leader" }
+tips      = { path = "crates/tips" }
+submitter = { path = "crates/submitter" }
+lifecycle = { path = "crates/lifecycle" }
+failure   = { path = "crates/failure" }
+agent     = { path = "crates/agent" }
+
+[profile.release]
+lto = "thin"

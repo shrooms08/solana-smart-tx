@@ -1,0 +1,27 @@
+[package]
+name = "stream"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+yellowstone-grpc-client = { workspace = true }
+yellowstone-grpc-proto = { workspace = true }
+solana-sdk = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Streaming primitives used to drive the bidirectional gRPC subscription
+# (the request side is a `futures::channel::mpsc` the gRPC client consumes).
+futures = "0.3"
+# Jitter for the reconnect backoff schedule.
+rand = "0.8"
+
+[dev-dependencies]
+# The `slot_probe` example is our live smoke test: it loads the same env the
+# orchestrator uses and prints real slot updates off a live endpoint.
+dotenvy = { workspace = true }
+tracing-subscriber = { workspace = true }

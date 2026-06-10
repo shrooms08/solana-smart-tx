@@ -1,0 +1,25 @@
+[package]
+name = "orchestrator"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+# Propagate test-only failure injection down into the submitter.
+fault-injection = ["submitter/fault-injection"]
+
+[dependencies]
+stream = { workspace = true }
+leader = { workspace = true }
+tips = { workspace = true }
+submitter = { workspace = true }
+lifecycle = { workspace = true }
+failure = { workspace = true }
+agent = { workspace = true }
+
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+dotenvy = { workspace = true }
