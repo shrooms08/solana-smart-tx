@@ -4,16 +4,16 @@ Solana transaction infrastructure — Yellowstone gRPC streaming, Jito bundle su
 
 ## Status
 
-🚧 **Work in progress.** Foundation crates are implemented and verified against live infrastructure; the submission, tracking, and reasoning layers are next.
+ **Work in progress.** Foundation crates are implemented and verified against live infrastructure; the submission, tracking, and reasoning layers are next.
 
-| Crate          | Role                                                              | Status |
+| Crate          | Role                                                             | Status |
 | -------------- | ---------------------------------------------------------------- | :----: |
 | `stream`       | Yellowstone gRPC (Dragon's Mouth) slot + transaction streaming   |   ✅   |
 | `leader`       | Jito leader-window detection (slot clock × leader schedule)      |   ✅   |
 | `tips`         | Jito bundle-tip market-data feed (WebSocket + REST fallback)     |   ✅   |
 | `submitter`    | Jito bundle construction & submission                            |   🚧   |
-| `lifecycle`    | Per-bundle lifecycle tracking & persistence                     |   🚧   |
-| `failure`      | Failure classification                                            |   🚧   |
+| `lifecycle`    | Per-bundle lifecycle tracking & persistence                      |   🚧   |
+| `failure`      | Failure classification                                           |   🚧   |
 | `agent`        | AI-driven failure reasoning                                      |   🚧   |
 | `orchestrator` | Wiring + control loop across all crates                          |   🚧   |
 
