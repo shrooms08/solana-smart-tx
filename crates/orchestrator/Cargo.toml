@@ -9,6 +9,7 @@ license.workspace = true
 fault-injection = ["submitter/fault-injection"]
 
 [dependencies]
+runtime = { workspace = true }
 stream = { workspace = true }
 leader = { workspace = true }
 tips = { workspace = true }
@@ -22,4 +23,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 dotenvy = { workspace = true }
+sqlx = { workspace = true }
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

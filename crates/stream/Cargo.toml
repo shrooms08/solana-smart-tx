@@ -5,6 +5,8 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+# Shared credential redaction for endpoint logging.
+runtime = { workspace = true }
 yellowstone-grpc-client = { workspace = true }
 yellowstone-grpc-proto = { workspace = true }
 solana-sdk = { workspace = true }

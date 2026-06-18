@@ -258,17 +258,6 @@ impl Default for LiveTransport {
     }
 }
 
-/// Install a process-default rustls crypto provider (ring) once, so the
-/// tokio-tungstenite TLS handshake has a provider to build its `ClientConfig`.
-fn ensure_crypto_provider() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        // Ignore the error if another component already installed a provider.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
 // The trait declares `-> impl Future + Send`; an `async fn` here satisfies it
 // and is only accepted if the resulting future is actually `Send`.
 impl TipTransport for LiveTransport {
@@ -278,7 +267,8 @@ impl TipTransport for LiveTransport {
     ) -> anyhow::Result<()> {
         use tokio_tungstenite::tungstenite::Message;
 
-        ensure_crypto_provider();
+        // Ensure the rustls CryptoProvider is installed (shared, process-wide).
+        runtime::init_crypto();
         let (ws_stream, _resp) = tokio_tungstenite::connect_async(&self.ws_url).await?;
         let (mut write, mut read) = ws_stream.split();
 
@@ -438,7 +428,7 @@ impl<T: TipTransport> TipTracker<T> {
             Backoff::new(self.inner.config.backoff_base, self.inner.config.backoff_cap);
 
         loop {
-            info!(url = TIP_STREAM_WS_URL, "connecting tip websocket");
+            info!(url = %runtime::redact_url(TIP_STREAM_WS_URL), "connecting tip websocket");
             let connected_at = Instant::now();
             let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
             let ws = self.inner.transport.run_websocket(tx);

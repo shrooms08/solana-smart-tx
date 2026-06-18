@@ -78,13 +78,19 @@ impl Default for LeaderConfig {
 pub struct LeaderWindow {
     /// Current slot per the live (processed) slot clock.
     pub current_slot: u64,
-    /// First upcoming slot (>= `current_slot`) whose leader runs Jito.
+    /// Start slot of the next *upcoming* Jito-led leader group (strictly ahead of
+    /// `current_slot`); never the current, already-active leader.
     pub next_jito_leader_slot: u64,
-    /// `next_jito_leader_slot - current_slot`. Zero when the *current* leader
-    /// is already a Jito leader (mid-window).
+    /// `next_jito_leader_slot - current_slot`. Always `>= 1` (we target ahead of
+    /// the leader, so the bundle can be buffered before its slot begins).
     pub slots_until: u64,
     /// Base58 identity of that leader, if known.
     pub leader_identity: Option<String>,
+    /// Whether the target leader runs BAM. BAM leaders score their auction on
+    /// `(tips + priority_fees) / CU` (vs `tips / CU` for plain Block Engine), so
+    /// the submitter can opt to add a priority fee to compete. Informational —
+    /// the leader-window math is unchanged by it.
+    pub is_bam: bool,
 }
 
 /// Health / staleness states surfaced as errors rather than stale windows.
@@ -112,6 +118,17 @@ pub enum LeaderError {
 // Data source trait + production implementation
 // ---------------------------------------------------------------------------
 
+/// Validator identity sets from the Jito validator API. `bam` is a subset of
+/// `jito` (a BAM validator also runs the Block Engine), distinguished because BAM
+/// leaders score their auction on `(tips + priority_fees) / CU`.
+#[derive(Debug, Default, Clone)]
+pub struct ValidatorSets {
+    /// Identities currently running Jito (eligible to process our bundles).
+    pub jito: HashSet<Pubkey>,
+    /// Subset of `jito` that also runs BAM.
+    pub bam: HashSet<Pubkey>,
+}
+
 /// The two network-backed inputs the tracker needs. Abstracted so unit tests
 /// can mock them without touching the network.
 pub trait LeaderDataSource: Send + Sync + 'static {
@@ -127,6 +144,22 @@ pub trait LeaderDataSource: Send + Sync + 'static {
     fn fetch_jito_validators(
         &self,
     ) -> impl std::future::Future<Output = anyhow::Result<HashSet<Pubkey>>> + Send;
+
+    /// The Jito **and** BAM validator sets in one fetch. The default delegates to
+    /// [`fetch_jito_validators`](Self::fetch_jito_validators) with an empty BAM set
+    /// (so existing/mocked sources need no change); production sources that can
+    /// distinguish BAM override this to populate both.
+    fn fetch_validator_sets(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<ValidatorSets>> + Send {
+        async move {
+            let jito = self.fetch_jito_validators().await?;
+            Ok(ValidatorSets {
+                jito,
+                bam: HashSet::new(),
+            })
+        }
+    }
 }
 
 /// Production data source: `solana-client` for the schedule, reqwest for the
@@ -164,6 +197,12 @@ struct KobeValidator {
     identity_account: String,
     #[serde(default)]
     running_jito: bool,
+    /// Whether this validator runs BAM (Block Assembly Marketplace). BAM leaders
+    /// run an additional auction scored on `(tips + priority_fees) / CU`, where
+    /// plain Block Engine leaders score on `tips / CU`. Present in the kobe API;
+    /// previously ignored.
+    #[serde(default)]
+    running_bam: bool,
 }
 
 // The trait declares `-> impl Future + Send` to guarantee `Send` futures for
@@ -180,6 +219,11 @@ impl LeaderDataSource for RpcJitoSource {
     }
 
     async fn fetch_jito_validators(&self) -> anyhow::Result<HashSet<Pubkey>> {
+        // Single source of truth: derive from the combined fetch.
+        Ok(self.fetch_validator_sets().await?.jito)
+    }
+
+    async fn fetch_validator_sets(&self) -> anyhow::Result<ValidatorSets> {
         let resp: KobeResponse = self
             .http
             .get(&self.jito_validators_url)
@@ -189,13 +233,20 @@ impl LeaderDataSource for RpcJitoSource {
             .json()
             .await?;
 
-        let set = resp
-            .validators
-            .into_iter()
-            .filter(|v| v.running_jito)
-            .filter_map(|v| Pubkey::from_str(&v.identity_account).ok())
-            .collect();
-        Ok(set)
+        let mut sets = ValidatorSets::default();
+        for v in resp.validators {
+            if !v.running_jito {
+                continue;
+            }
+            let Ok(identity) = Pubkey::from_str(&v.identity_account) else {
+                continue;
+            };
+            sets.jito.insert(identity);
+            if v.running_bam {
+                sets.bam.insert(identity);
+            }
+        }
+        Ok(sets)
     }
 }
 
@@ -219,7 +270,7 @@ struct LeaderSchedule {
 }
 
 struct JitoSet {
-    set: HashSet<Pubkey>,
+    sets: ValidatorSets,
     fetched_at: Instant,
 }
 
@@ -235,13 +286,18 @@ struct Inner<D> {
 
 impl<D: LeaderDataSource> Inner<D> {
     async fn refresh_jito(&self) -> anyhow::Result<()> {
-        let set = self.source.fetch_jito_validators().await?;
-        let n = set.len();
+        let sets = self.source.fetch_validator_sets().await?;
+        let n_jito = sets.jito.len();
+        let n_bam = sets.bam.len();
         *self.jito.write().unwrap() = Some(JitoSet {
-            set,
+            sets,
             fetched_at: Instant::now(),
         });
-        info!(jito_validators = n, "refreshed Jito validator set");
+        info!(
+            jito_validators = n_jito,
+            bam_validators = n_bam,
+            "refreshed Jito validator set"
+        );
         Ok(())
     }
 
@@ -274,6 +330,17 @@ impl<D: LeaderDataSource> Inner<D> {
 /// First slot `>= current_slot` within the cached schedule whose leader is in
 /// `jito`, plus that leader. `None` if the lookahead window contains no Jito
 /// leader. Returns `current_slot` itself when the current leader runs Jito.
+/// Solana assigns leaders in fixed groups of this many consecutive slots
+/// (`NUM_CONSECUTIVE_LEADER_SLOTS`). We target the START of an upcoming group so
+/// the bundle can be buffered before that leader begins producing.
+const LEADER_SLOTS_PER_GROUP: u64 = 4;
+
+/// Find the next Jito-led leader-group **start** strictly *ahead* of
+/// `current_slot` — i.e., the beginning of an upcoming leader's slot group. We
+/// deliberately skip the current (already-active) leader group: with Jito at
+/// ~95% of stake the current slot is almost always Jito-led, and submitting then
+/// arrives after the slot is gone. Targeting the next group start gives the
+/// bundle lead time to be buffered before the leader starts.
 fn next_jito_leader(
     current_slot: u64,
     start_slot: u64,
@@ -284,15 +351,21 @@ fn next_jito_leader(
         return None;
     }
     let end = start_slot + leaders.len() as u64; // exclusive
-    let from = current_slot.max(start_slot);
-    let mut slot = from;
+
+    // First leader-group boundary strictly after current_slot.
+    let next_group_start =
+        current_slot - (current_slot % LEADER_SLOTS_PER_GROUP) + LEADER_SLOTS_PER_GROUP;
+    let mut slot = next_group_start.max(start_slot);
+
+    // Step group-by-group; each group's leader (read at its start) leads all its
+    // slots, so checking the group start is sufficient.
     while slot < end {
         let idx = (slot - start_slot) as usize;
         let leader = leaders[idx];
         if jito.contains(&leader) {
             return Some((slot, leader));
         }
-        slot += 1;
+        slot += LEADER_SLOTS_PER_GROUP;
     }
     None
 }
@@ -390,7 +463,8 @@ impl<D: LeaderDataSource> LeaderTracker<D> {
             };
             let interval = inner.config.jito_refresh;
             if let Err(err) = inner.refresh_jito().await {
-                warn!(error = %err, "failed to refresh Jito validator set");
+                // The error may embed the request URL; keep credentials out of logs.
+                warn!(error = %runtime::redact_url(&err.to_string()), "failed to refresh Jito validator set");
             }
             drop(inner); // don't hold a strong ref across the sleep
             tokio::time::sleep(interval).await;
@@ -412,7 +486,8 @@ impl<D: LeaderDataSource> LeaderTracker<D> {
             };
             if has_clock {
                 if let Err(err) = inner.refresh_schedule().await {
-                    warn!(error = %err, "failed to refresh leader schedule");
+                    // RPC errors include the full URL (e.g. `?api_key=…`); redact it.
+                    warn!(error = %runtime::redact_url(&err.to_string()), "failed to refresh leader schedule");
                 }
             }
             drop(inner);
@@ -457,15 +532,18 @@ impl<D: LeaderDataSource> LeaderTracker<D> {
             current_slot,
             schedule.start_slot,
             &schedule.leaders,
-            &jito.set,
+            &jito.sets.jito,
         )
         .ok_or(LeaderError::NoJitoLeaderInLookahead)?;
+
+        let is_bam = jito.sets.bam.contains(&leader);
 
         Ok(LeaderWindow {
             current_slot,
             next_jito_leader_slot: next_slot,
             slots_until: next_slot - current_slot,
             leader_identity: Some(leader.to_string()),
+            is_bam,
         })
     }
 
@@ -481,13 +559,19 @@ impl<D: LeaderDataSource> LeaderTracker<D> {
             let notified = self.inner.tick.notified();
 
             match self.current_window().await {
-                Ok(window) if window.slots_until <= self.inner.config.threshold_slots => {
+                // Resolve only when we are 1..=threshold slots AHEAD of the next
+                // Jito leader group — never at slots_until==0 (leader already
+                // active, too late to buffer the bundle).
+                Ok(window)
+                    if (1..=self.inner.config.threshold_slots).contains(&window.slots_until) =>
+                {
                     info!(
                         current_slot = window.current_slot,
                         next_jito_leader_slot = window.next_jito_leader_slot,
                         slots_until = window.slots_until,
                         leader = ?window.leader_identity,
-                        "Jito leader window open"
+                        is_bam = window.is_bam,
+                        "Jito leader window open (ahead of leader)"
                     );
                     return Ok(window);
                 }
@@ -543,13 +627,32 @@ mod tests {
     }
 
     #[test]
-    fn next_jito_leader_zero_when_current_is_jito() {
+    fn next_jito_leader_targets_next_group_start_not_current() {
         let a = Pubkey::new_unique();
-        let leaders = vec![a, a, a, a];
+        // Two Jito groups: 100..=103 and 104..=107, both led by `a` (Jito).
+        let leaders = vec![a, a, a, a, a, a, a, a];
         let jito = jito_set(&[a]);
-        // Current leader IS a Jito leader -> next slot is the current slot.
+        // Mid-way through the current group (current=101); must NOT return 101 —
+        // it targets the START of the NEXT group (104), strictly ahead.
         let (slot, _) = next_jito_leader(101, 100, &leaders, &jito).unwrap();
-        assert_eq!(slot, 101);
+        assert_eq!(slot, 104);
+        // Even at a group start (current=104), we target the *next* group (108)...
+        // but 108 is out of this 8-slot schedule -> None.
+        assert!(next_jito_leader(104, 100, &leaders, &jito).is_none());
+    }
+
+    #[test]
+    fn next_jito_leader_skips_non_jito_groups() {
+        let a = Pubkey::new_unique(); // non-Jito
+        let b = Pubkey::new_unique(); // Jito
+        // group 100..=103 -> a, group 104..=107 -> a, group 108..=111 -> b.
+        let mut leaders = vec![a; 8];
+        leaders.extend(vec![b; 4]); // 108..=111
+        let jito = jito_set(&[b]);
+        // From slot 100, the next Jito group start is 108.
+        let (slot, leader) = next_jito_leader(100, 100, &leaders, &jito).unwrap();
+        assert_eq!(slot, 108);
+        assert_eq!(leader, b);
     }
 
     #[test]
@@ -621,20 +724,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_leader_is_jito_gives_zero_slots_until() {
+    async fn current_leader_is_jito_targets_next_group_ahead() {
         let a = Pubkey::new_unique();
+        // Current group (100..=103) is Jito-led, plus the next group (104..=107).
         let source = MockSource {
-            leaders: vec![a, a, a, a],
+            leaders: vec![a; 8],
             jito: jito_set(&[a]),
         };
         let tracker = LeaderTracker::new(LeaderConfig::default(), source);
-        tracker.ingest(&slot_event(100));
+        tracker.ingest(&slot_event(101)); // mid-way through the current group
         tracker.refresh_jito().await.unwrap();
         tracker.refresh_schedule().await.unwrap();
 
+        // Even though slot 101's leader is Jito, we target the NEXT group start
+        // (104) — ahead of the leader — so slots_until is >= 1, never 0.
         let window = tracker.current_window().await.unwrap();
-        assert_eq!(window.slots_until, 0);
-        assert_eq!(window.next_jito_leader_slot, 100);
+        assert_eq!(window.next_jito_leader_slot, 104);
+        assert_eq!(window.slots_until, 3);
+        assert!(window.slots_until >= 1);
     }
 
     #[tokio::test]
@@ -677,6 +784,79 @@ mod tests {
             downcast(tracker.current_window().await.unwrap_err()),
             LeaderError::NoJitoLeaderInLookahead
         );
+    }
+
+    // A source that distinguishes BAM validators (overrides fetch_validator_sets).
+    struct BamSource {
+        leaders: Vec<Pubkey>,
+        sets: ValidatorSets,
+    }
+
+    impl LeaderDataSource for BamSource {
+        async fn fetch_slot_leaders(&self, _: u64, _: u64) -> anyhow::Result<Vec<Pubkey>> {
+            Ok(self.leaders.clone())
+        }
+        async fn fetch_jito_validators(&self) -> anyhow::Result<HashSet<Pubkey>> {
+            Ok(self.sets.jito.clone())
+        }
+        async fn fetch_validator_sets(&self) -> anyhow::Result<ValidatorSets> {
+            Ok(self.sets.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn window_surfaces_is_bam_for_target_leader() {
+        let bam_leader = Pubkey::new_unique();
+        let plain_leader = Pubkey::new_unique();
+
+        // Target group (104..=107) led by a BAM validator -> is_bam true.
+        let bam_window = {
+            let leaders = vec![plain_leader, plain_leader, plain_leader, plain_leader,
+                               bam_leader, bam_leader, bam_leader, bam_leader];
+            let sets = ValidatorSets {
+                jito: jito_set(&[plain_leader, bam_leader]),
+                bam: jito_set(&[bam_leader]),
+            };
+            let tracker = LeaderTracker::new(LeaderConfig::default(), BamSource { leaders, sets });
+            tracker.ingest(&slot_event(100));
+            tracker.refresh_jito().await.unwrap();
+            tracker.refresh_schedule().await.unwrap();
+            tracker.current_window().await.unwrap()
+        };
+        assert_eq!(bam_window.next_jito_leader_slot, 104);
+        assert!(bam_window.is_bam, "BAM leader should set is_bam");
+
+        // A Jito-but-not-BAM target leader -> is_bam false.
+        let plain_window = {
+            let leaders = vec![bam_leader, bam_leader, bam_leader, bam_leader,
+                               plain_leader, plain_leader, plain_leader, plain_leader];
+            let sets = ValidatorSets {
+                jito: jito_set(&[plain_leader, bam_leader]),
+                bam: jito_set(&[bam_leader]),
+            };
+            let tracker = LeaderTracker::new(LeaderConfig::default(), BamSource { leaders, sets });
+            tracker.ingest(&slot_event(100));
+            tracker.refresh_jito().await.unwrap();
+            tracker.refresh_schedule().await.unwrap();
+            tracker.current_window().await.unwrap()
+        };
+        assert_eq!(plain_window.next_jito_leader_slot, 104);
+        assert!(!plain_window.is_bam, "non-BAM Jito leader should not set is_bam");
+    }
+
+    #[tokio::test]
+    async fn mock_source_defaults_is_bam_false() {
+        // The default fetch_validator_sets (no BAM info) yields is_bam = false.
+        let a = Pubkey::new_unique();
+        let source = MockSource {
+            leaders: vec![a; 8],
+            jito: jito_set(&[a]),
+        };
+        let tracker = LeaderTracker::new(LeaderConfig::default(), source);
+        tracker.ingest(&slot_event(100));
+        tracker.refresh_jito().await.unwrap();
+        tracker.refresh_schedule().await.unwrap();
+        assert!(!tracker.current_window().await.unwrap().is_bam);
     }
 
     #[tokio::test]

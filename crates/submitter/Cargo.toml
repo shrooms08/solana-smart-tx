@@ -5,15 +5,31 @@ version.workspace = true
 license.workspace = true
 
 [features]
-# Gate test-only failure injection (dropped bundles, forced fee-too-low, ...).
+# Gate test-only failure injection (stale blockhash, sub-floor tip, ...).
 fault-injection = []
 
 [dependencies]
-jito-sdk-rust = { workspace = true }
+# Shared credential redaction for block-engine error logging.
+runtime = { workspace = true }
 solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+# solana-sdk 4.0 dropped `system_instruction`; the transfer builder now lives
+# here (behind the `bincode` feature). `CommitmentConfig` likewise moved out.
+solana-system-interface = { version = "2.0", features = ["bincode"] }
+solana-commitment-config = "3.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Direct getTipAccounts fetch (the SDK helper returns an empty body for us).
+reqwest = { workspace = true }
+# Transaction wire-encoding for the bundle (bincode -> base64), as Jito expects.
+bincode = "1.3"
+base64 = "0.22"
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# The simulate_bundle example loads .env + the wallet and runs a live RPC sim.
+dotenvy = { workspace = true }
+tracing-subscriber = { workspace = true }

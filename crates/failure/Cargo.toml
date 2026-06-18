@@ -6,4 +6,9 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-thiserror = { workspace = true }
+# Pure decoding of on-chain errors. `solana_sdk::transaction::TransactionError`
+# re-exports exactly these crates; depending on them directly keeps `failure`
+# lean and network-free while decoding the identical bincode wire format.
+solana-transaction-error = { version = "3.1", features = ["serde"] }
+solana-instruction-error = { version = "2.3", features = ["serde"] }
+bincode = "1.3"

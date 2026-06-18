@@ -16,6 +16,8 @@ use tips::{LiveTransport, TipConfig, TipTracker, TIP_FLOOR_REST_URL, TIP_STREAM_
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install the rustls CryptoProvider before any TLS client connects.
+    runtime::init_crypto();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

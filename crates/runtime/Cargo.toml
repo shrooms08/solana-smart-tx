@@ -1,0 +1,11 @@
+[package]
+name = "runtime"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Only here to install a process-default CryptoProvider. rustls 0.23 refuses to
+# pick one automatically when both `ring` and `aws-lc-rs` are in the graph, so we
+# install `ring` explicitly. Keep this the single home for that decision.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

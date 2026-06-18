@@ -5,10 +5,23 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+# Upstream workspace crates this state machine is driven by.
+stream = { workspace = true }
+submitter = { workspace = true }
 failure = { workspace = true }
+
 sqlx = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+
+# reconcile() against a real RPC: nonblocking client + signature/status types.
+# solana-sdk for Signature; bincode to re-encode a reconciled TransactionError
+# into the same hex form the stream produces (so failure::classify owns it).
+solana-sdk = { workspace = true }
+solana-rpc-client = "4.0"
+solana-transaction-status-client-types = "4.0"
+bincode = "1.3"

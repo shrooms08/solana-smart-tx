@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/runtime",
     "crates/stream",
     "crates/leader",
     "crates/tips",
@@ -63,6 +64,7 @@ thiserror = "2.0"
 dotenvy = "0.15"
 
 # Internal crates
+runtime   = { path = "crates/runtime" }
 stream    = { path = "crates/stream" }
 leader    = { path = "crates/leader" }
 tips      = { path = "crates/tips" }

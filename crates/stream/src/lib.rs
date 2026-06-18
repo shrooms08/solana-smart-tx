@@ -245,9 +245,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 // Subscription request
 // ---------------------------------------------------------------------------
 
-/// Build the `SubscribeRequest` for our two filters:
+/// Build the `SubscribeRequest`:
 ///   * `slots`: all slot status updates (processed / confirmed / finalized).
-///   * `transactions`: every (including failed) tx touching a monitored pubkey.
+///   * `transactions`: every (including failed) tx touching a monitored pubkey —
+///     **only when `monitored` is non-empty**.
+///
+/// A transactions filter with an empty `account_include` does NOT mean "no
+/// transactions" in Yellowstone semantics — it matches **every** transaction on
+/// mainnet (a firehose). Combined with our guaranteed `send().await` on the
+/// tx-event path (correct for our wallet's rare events), that firehose stalls
+/// the receive loop, the server's send buffer fills, and the provider closes
+/// the stream. So with no pubkeys to monitor we subscribe to slots only.
 fn build_subscribe_request(monitored: &[Pubkey]) -> SubscribeRequest {
     let mut slots = std::collections::HashMap::new();
     slots.insert(
@@ -263,21 +271,23 @@ fn build_subscribe_request(monitored: &[Pubkey]) -> SubscribeRequest {
     );
 
     let mut transactions = std::collections::HashMap::new();
-    transactions.insert(
-        "monitored".to_owned(),
-        SubscribeRequestFilterTransactions {
-            // Include failures — a failed tx from our wallet is exactly what the
-            // failure-analysis path needs to see.
-            failed: Some(true),
-            // Don't constrain on vote-ness; the account filter keeps vote txs
-            // out anyway since our wallet never votes.
-            vote: None,
-            signature: None,
-            account_include: monitored.iter().map(|p| p.to_string()).collect(),
-            account_exclude: Vec::new(),
-            account_required: Vec::new(),
-        },
-    );
+    if !monitored.is_empty() {
+        transactions.insert(
+            "monitored".to_owned(),
+            SubscribeRequestFilterTransactions {
+                // Include failures — a failed tx from our wallet is exactly what
+                // the failure-analysis path needs to see.
+                failed: Some(true),
+                // Don't constrain on vote-ness; the account filter keeps vote txs
+                // out anyway since our wallet never votes.
+                vote: None,
+                signature: None,
+                account_include: monitored.iter().map(|p| p.to_string()).collect(),
+                account_exclude: Vec::new(),
+                account_required: Vec::new(),
+            },
+        );
+    }
 
     SubscribeRequest {
         slots,
@@ -351,22 +361,64 @@ impl StreamClient {
         monitored_pubkeys: Vec<Pubkey>,
         event_tx: mpsc::Sender<StreamEvent>,
     ) -> anyhow::Result<()> {
+        Self::run_inner(config, monitored_pubkeys, event_tx, None).await
+    }
+
+    /// Like [`run`](Self::run), but sends the connection attempt number on
+    /// `reconnect_tx` each time the stream is *re-established* (attempt > 1) — so
+    /// the caller can trigger a catch-up reconcile after a gap. The first
+    /// successful connection is not signalled.
+    pub async fn run_with_reconnect(
+        config: StreamConfig,
+        monitored_pubkeys: Vec<Pubkey>,
+        event_tx: mpsc::Sender<StreamEvent>,
+        reconnect_tx: mpsc::Sender<u64>,
+    ) -> anyhow::Result<()> {
+        Self::run_inner(config, monitored_pubkeys, event_tx, Some(reconnect_tx)).await
+    }
+
+    async fn run_inner(
+        config: StreamConfig,
+        monitored_pubkeys: Vec<Pubkey>,
+        event_tx: mpsc::Sender<StreamEvent>,
+        reconnect_tx: Option<mpsc::Sender<u64>>,
+    ) -> anyhow::Result<()> {
         let request = build_subscribe_request(&monitored_pubkeys);
         let mut backoff = Backoff::default();
         let mut dropped_slots: u64 = 0;
         let mut attempt: u64 = 0;
 
+        // State which filters the subscription carries — slots-only vs
+        // slots+transactions — so an accidental firehose is obvious in the logs.
+        let filters = if request.transactions.is_empty() {
+            "slots"
+        } else {
+            "slots+transactions"
+        };
+        info!(
+            filters,
+            monitored = monitored_pubkeys.len(),
+            "built Yellowstone subscription"
+        );
+
         loop {
             attempt += 1;
             info!(
                 attempt,
-                endpoint = %config.endpoint,
+                endpoint = %runtime::redact_url(&config.endpoint),
                 monitored = monitored_pubkeys.len(),
                 "connecting to Yellowstone"
             );
 
-            let outcome =
-                Self::run_connection(&config, &request, &event_tx, &mut dropped_slots).await;
+            let outcome = Self::run_connection(
+                &config,
+                &request,
+                &event_tx,
+                &mut dropped_slots,
+                attempt,
+                reconnect_tx.as_ref(),
+            )
+            .await;
 
             // A connection that lived long enough is "healthy": reset the
             // schedule so a single blip doesn't inherit a long delay.
@@ -400,6 +452,8 @@ impl StreamClient {
         request: &SubscribeRequest,
         event_tx: &mpsc::Sender<StreamEvent>,
         dropped_slots: &mut u64,
+        attempt: u64,
+        reconnect_tx: Option<&mpsc::Sender<u64>>,
     ) -> ConnOutcome {
         // Time the connect attempt too; a connect that fails instantly yields a
         // ~zero uptime, so the backoff won't reset.
@@ -442,7 +496,14 @@ impl StreamClient {
 
         // Connection is established; measure uptime from here.
         let connected_at = Instant::now();
-        info!(endpoint = %config.endpoint, "Yellowstone connected; streaming");
+        info!(endpoint = %runtime::redact_url(&config.endpoint), "Yellowstone connected; streaming");
+        // Notify the caller of a *reconnect* (not the first connection) so it can
+        // run a catch-up reconcile over the gap.
+        if attempt > 1 {
+            if let Some(tx) = reconnect_tx {
+                let _ = tx.try_send(attempt);
+            }
+        }
         let _req_tx = req_tx; // keep the request stream open for this connection
 
         let mut report = tokio::time::interval(DROPPED_REPORT_INTERVAL);
@@ -644,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_request_has_both_filters() {
+    fn subscribe_request_non_empty_includes_tx_filter() {
         let pk = Pubkey::new_unique();
         let req = build_subscribe_request(&[pk]);
         assert_eq!(req.slots.len(), 1);
@@ -652,5 +713,17 @@ mod tests {
         let tx_filter = req.transactions.values().next().unwrap();
         assert_eq!(tx_filter.failed, Some(true));
         assert_eq!(tx_filter.account_include, vec![pk.to_string()]);
+    }
+
+    #[test]
+    fn subscribe_request_empty_is_slots_only() {
+        // No monitored pubkeys must NOT produce a transactions filter: an empty
+        // account_include is a match-everything firehose in Yellowstone.
+        let req = build_subscribe_request(&[]);
+        assert_eq!(req.slots.len(), 1);
+        assert!(
+            req.transactions.is_empty(),
+            "empty monitored set must omit the transactions filter (firehose guard)"
+        );
     }
 }

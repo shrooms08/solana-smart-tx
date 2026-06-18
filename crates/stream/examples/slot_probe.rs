@@ -26,6 +26,8 @@ const CHANNEL_CAPACITY: usize = 1024;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install the rustls CryptoProvider before any TLS client connects.
+    runtime::init_crypto();
     // Best-effort .env load; real env vars still win.
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()

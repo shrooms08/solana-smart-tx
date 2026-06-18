@@ -25,6 +25,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install the rustls CryptoProvider before any TLS client connects.
+    runtime::init_crypto();
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -61,10 +63,11 @@ async fn main() -> anyhow::Result<()> {
                     Ok(window) => {
                         if last_announced != Some(window.next_jito_leader_slot) {
                             println!(
-                                "🔔 JITO WINDOW OPEN — slot {} (in {} slots), leader {}",
+                                "🔔 JITO WINDOW OPEN — slot {} (in {} slots), leader {} [{}]",
                                 window.next_jito_leader_slot,
                                 window.slots_until,
                                 window.leader_identity.as_deref().unwrap_or("?"),
+                                if window.is_bam { "BAM" } else { "Block Engine" },
                             );
                             last_announced = Some(window.next_jito_leader_slot);
                         }
@@ -86,11 +89,12 @@ async fn main() -> anyhow::Result<()> {
         ticker.tick().await;
         match tracker.current_window().await {
             Ok(w) => println!(
-                "slot {:>12}  next_jito {:>12}  in {:>3} slots  leader {}",
+                "slot {:>12}  next_jito {:>12}  in {:>3} slots  leader {} [{}]",
                 w.current_slot,
                 w.next_jito_leader_slot,
                 w.slots_until,
                 w.leader_identity.as_deref().unwrap_or("?"),
+                if w.is_bam { "BAM" } else { "BE" },
             ),
             Err(err) => println!("slot ?            health: {err}"),
         }
