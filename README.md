@@ -8,6 +8,7 @@ evidence, and lets an AI agent own one operational decision — what to do when 
 bundle does not land.
 
 For the full design rationale, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+For the central operational finding, see [FINDINGS.md](./FINDINGS.md).
 
 ---
 
