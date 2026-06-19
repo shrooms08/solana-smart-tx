@@ -45,6 +45,10 @@ pub struct Config {
     /// Priority fee (micro-lamports/CU) added for BAM leaders when enabled.
     /// `BAM_PRIORITY_FEE_MICROLAMPORTS`.
     pub bam_priority_fee_microlamports: u64,
+    /// Requested compute-unit limit paired with the BAM priority fee — pins the
+    /// CU denominator so `price × limit` (the fee) and the `(tips + prio_fees)/CU`
+    /// ratio are predictable. `BAM_PRIORITY_FEE_CU_LIMIT` (default 10_000).
+    pub bam_priority_fee_cu_limit: u32,
     /// Hard cap on total submission attempts per bundle (including the first).
     pub max_attempts: u32,
     /// Anthropic model id.
@@ -94,6 +98,7 @@ impl std::fmt::Debug for Config {
                 "bam_priority_fee_microlamports",
                 &self.bam_priority_fee_microlamports,
             )
+            .field("bam_priority_fee_cu_limit", &self.bam_priority_fee_cu_limit)
             .field("max_attempts", &self.max_attempts)
             .field("agent_model", &self.agent_model)
             .field("tip_percentile", &self.tip_percentile.as_str())
@@ -123,6 +128,7 @@ impl Config {
             jito_auth_uuid: std::env::var("JITO_AUTH_UUID").ok().filter(|s| !s.is_empty()),
             bam_priority_fee_enabled: bool_flag("BAM_PRIORITY_FEE_ENABLED"),
             bam_priority_fee_microlamports: parse_or("BAM_PRIORITY_FEE_MICROLAMPORTS", 0)?,
+            bam_priority_fee_cu_limit: parse_or("BAM_PRIORITY_FEE_CU_LIMIT", 10_000)?,
             max_attempts: parse_or("MAX_ATTEMPTS", 4)?,
             agent_model: optional("AGENT_MODEL", agent::DEFAULT_MODEL),
             agent_timeout: Duration::from_secs(10),

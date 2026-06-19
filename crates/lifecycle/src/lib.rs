@@ -107,6 +107,9 @@ struct Pending {
     tip_lamports: u64,
     tip_p50: Option<u64>,
     tip_p75: Option<u64>,
+    /// Last Jito `getInflightBundleStatuses` verdict (poller-recorded), used by the
+    /// never-landed classifier to distinguish AuctionLost from ExpiredBlockhash.
+    jito_inflight: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -253,6 +256,8 @@ pub struct LogRow {
     pub processed_source: Option<String>,
     pub confirmed_source: Option<String>,
     pub finalized_source: Option<String>,
+    /// Last Jito `getInflightBundleStatuses` verdict (poller-recorded).
+    pub jito_inflight_status: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -455,10 +460,30 @@ impl LifecycleTracker {
                 tip_lamports: record.tip_lamports,
                 tip_p50,
                 tip_p75,
+                jito_inflight: None,
             },
         );
         debug!(id, bundle_id = %record.bundle_id, "recorded submission");
         Ok(id)
+    }
+
+    /// Record the latest Jito `getInflightBundleStatuses` verdict for a bundle
+    /// (called by the bundle-status poller). Persists it and updates the in-memory
+    /// pending record so a later never-landed timeout classifies AuctionLost vs
+    /// ExpiredBlockhash correctly. No-op for already-terminal/unknown rows.
+    pub async fn record_jito_status(&self, id: i64, status: &str) -> anyhow::Result<()> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(p) = inner.pending.get_mut(&id) {
+                p.jito_inflight = Some(status.to_string());
+            }
+        }
+        sqlx::query("UPDATE bundle_submissions SET jito_inflight_status=? WHERE id=?")
+            .bind(status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// `sendBundle` failed synchronously: classify the raw error as a
@@ -538,6 +563,7 @@ impl LifecycleTracker {
                     tip_lamports: p.tip_lamports,
                     tip_p50_at_submit: p.tip_p50,
                     tip_p75_at_submit: p.tip_p75,
+                    jito_inflight: failure::JitoInflight::from_status_str(p.jito_inflight.as_deref()),
                 };
                 let classification = failure::classify(&evidence);
                 forget(&mut inner, id);
@@ -907,12 +933,13 @@ async fn hydrate(pool: &SqlitePool) -> anyhow::Result<Inner> {
         tip_lamports: i64,
         tip_p50_at_submit: Option<i64>,
         tip_p75_at_submit: Option<i64>,
+        jito_inflight_status: Option<String>,
     }
 
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT id, memo_signature, status, submitted_slot, blockhash_fetched_at_slot, \
          landed_slot, submitted_at, processed_at, confirmed_at, tip_lamports, \
-         tip_p50_at_submit, tip_p75_at_submit FROM bundle_submissions \
+         tip_p50_at_submit, tip_p75_at_submit, jito_inflight_status FROM bundle_submissions \
          WHERE status IN ('Submitted','Processed','Confirmed')",
     )
     .fetch_all(pool)
@@ -937,6 +964,7 @@ async fn hydrate(pool: &SqlitePool) -> anyhow::Result<Inner> {
                 tip_lamports: row.tip_lamports as u64,
                 tip_p50: row.tip_p50_at_submit.map(|v| v as u64),
                 tip_p75: row.tip_p75_at_submit.map(|v| v as u64),
+                jito_inflight: row.jito_inflight_status,
             },
         );
         match (state, landed_slot) {
@@ -1178,7 +1206,9 @@ mod tests {
         let t = LifecycleTracker::new(pool.clone(), LifecycleConfig::default())
             .await
             .unwrap();
-        // Tip competitive (>= p50) so only blockhash-age drives it -> ExpiredBlockhash.
+        // Competitive tip, blockhash valid at submission, no Jito status recorded.
+        // The blockhash only ages while waiting -> AuctionLost (inferred), NOT
+        // ExpiredBlockhash (the expiry is a downstream symptom).
         let id = t
             .record_submission(
                 &record("b3", "sigC", 1000, 50_000, 0),
@@ -1198,8 +1228,46 @@ mod tests {
 
         let row = fetch(&pool, id).await;
         assert_eq!(row.status, "Failed");
-        assert_eq!(row.failure_kind.as_deref(), Some("ExpiredBlockhash"));
+        assert_eq!(row.failure_kind.as_deref(), Some("AuctionLost"));
         assert!(row.failure_rationale.unwrap().contains("tip 50000"));
+    }
+
+    #[tokio::test]
+    async fn timeout_with_recorded_jito_invalid_status_is_auction_lost() {
+        // End-to-end plumbing: the bundle-status poller recorded Jito 'Invalid';
+        // when the bundle later times out as never-landed, the classifier sees that
+        // status and classifies AuctionLost (Certain) — not ExpiredBlockhash.
+        let pool = mem_pool().await;
+        let t = LifecycleTracker::new(pool.clone(), LifecycleConfig::default())
+            .await
+            .unwrap();
+        let id = t
+            .record_submission(
+                &record("b3i", "sigCi", 1000, 50_000, 0),
+                Some(50_000),
+                Some(70_000),
+            )
+            .await
+            .unwrap();
+
+        // Poller observes Invalid (accepted but not in Jito's system).
+        t.record_jito_status(id, "Invalid").await.unwrap();
+        assert_eq!(
+            fetch(&pool, id).await.jito_inflight_status.as_deref(),
+            Some("Invalid")
+        );
+
+        t.ingest_and_persist(&slot_event(1161, SlotStatus::Processed, 10))
+            .await
+            .unwrap();
+        assert_eq!(t.check_timeouts().await.unwrap(), vec![id]);
+
+        let row = fetch(&pool, id).await;
+        assert_eq!(row.failure_kind.as_deref(), Some("AuctionLost"));
+        assert_eq!(row.failure_confidence.as_deref(), Some("Certain"));
+        let rationale = row.failure_rationale.unwrap();
+        assert!(rationale.contains("Invalid"));
+        assert!(rationale.to_lowercase().contains("auction") || rationale.contains("did not win"));
     }
 
     #[tokio::test]

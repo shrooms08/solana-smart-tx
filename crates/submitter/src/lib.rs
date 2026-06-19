@@ -41,6 +41,11 @@ pub const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget1111111111111111111111
 /// index 3) in the program's borsh-encoded instruction enum.
 const SET_COMPUTE_UNIT_PRICE_DISCRIMINANT: u8 = 3;
 
+/// `ComputeBudgetInstruction::SetComputeUnitLimit` discriminant (index 2). Caps
+/// the tx's requested compute units — the denominator in both the priority-fee
+/// charge (`price × limit`) and the auction's `(tips + prio_fees) / CU` ratio.
+const SET_COMPUTE_UNIT_LIMIT_DISCRIMINANT: u8 = 2;
+
 // ---------------------------------------------------------------------------
 // Config / spec
 // ---------------------------------------------------------------------------
@@ -102,6 +107,13 @@ pub struct BundleSpec {
     /// auction. `0` (the default) adds nothing — behavior is unchanged. The
     /// orchestrator sets this only for BAM leaders when the feature is enabled.
     pub priority_fee_microlamports: u64,
+    /// Requested compute-unit limit for the payload tx, paired with the priority
+    /// fee. When `> 0` (and a priority fee is set), a
+    /// `ComputeBudget::SetComputeUnitLimit` instruction pins the CU denominator so
+    /// the fee (`price × limit`) and the auction's `(tips + prio_fees) / CU` ratio
+    /// are predictable, instead of the unbounded `200k × num_instructions` default.
+    /// `0` leaves the CU limit at the runtime default.
+    pub priority_fee_cu_limit: u32,
     /// Optional injected fault (compiled out without `fault-injection`).
     #[cfg(feature = "fault-injection")]
     pub fault: Option<Fault>,
@@ -906,6 +918,20 @@ fn compute_unit_price_instruction(micro_lamports: u64) -> Instruction {
     }
 }
 
+/// `ComputeBudget::SetComputeUnitLimit(units)` — caps the tx's requested compute
+/// units. Borsh: 1-byte discriminant (2) + u32 limit (little-endian), no accounts.
+/// Pinned by [`tests::compute_unit_limit_instruction_encoding`].
+fn compute_unit_limit_instruction(units: u32) -> Instruction {
+    let mut data = Vec::with_capacity(5);
+    data.push(SET_COMPUTE_UNIT_LIMIT_DISCRIMINANT);
+    data.extend_from_slice(&units.to_le_bytes());
+    Instruction {
+        program_id: compute_budget_program_id(),
+        accounts: Vec::new(),
+        data,
+    }
+}
+
 /// The constructed, signed pair plus their wire encodings.
 struct BuiltBundle {
     // Retained for offline test inspection; `submit` only sends the encodings.
@@ -929,26 +955,36 @@ struct BuiltBundle {
 /// wallet pays itself). The memo is retained as our on-chain tracking marker.
 /// Both txs are signed by `keypair` (the fee payer) and share `blockhash`.
 ///
-/// When `priority_fee_microlamports > 0`, a `SetComputeUnitPrice` instruction is
-/// prepended to tx1 so the bundle pays a priority fee — competing in a BAM
-/// leader's `(tips + priority_fees) / CU` auction. `0` adds nothing (unchanged).
+/// When `priority_fee_microlamports > 0`, a `SetComputeUnitLimit` (if
+/// `priority_fee_cu_limit > 0`) followed by a `SetComputeUnitPrice` instruction is
+/// prepended to tx1 so the bundle pays a priority fee with a pinned CU
+/// denominator — competing in a BAM leader's `(tips + priority_fees) / CU`
+/// auction. `0` priority fee adds nothing (unchanged).
+#[allow(clippy::too_many_arguments)] // cohesive bundle-construction inputs; a struct would just move the noise
 fn build_bundle(
     keypair: &Keypair,
     memo: &str,
     self_transfer_lamports: u64,
     priority_fee_microlamports: u64,
+    priority_fee_cu_limit: u32,
     tip_lamports: u64,
     tip_account: &Pubkey,
     blockhash: Hash,
 ) -> anyhow::Result<BuiltBundle> {
     let payer = keypair.pubkey();
 
-    // tx1: [optional priority fee] + memo (tracking marker) + self-transfer
-    // (real economic content). The priority fee goes first, per convention.
+    // tx1: [optional CU limit] + [optional priority fee] + memo (tracking marker)
+    // + self-transfer (real economic content). The compute-budget instructions go
+    // first, per convention (limit before price).
     let self_transfer_ix =
         solana_system_interface::instruction::transfer(&payer, &payer, self_transfer_lamports);
-    let mut payload_ixs = Vec::with_capacity(3);
+    let mut payload_ixs = Vec::with_capacity(4);
     if priority_fee_microlamports > 0 {
+        // Pin the CU denominator first so `price × limit` (the fee) and the
+        // auction ratio are predictable, not the ~200k×N-instruction default.
+        if priority_fee_cu_limit > 0 {
+            payload_ixs.push(compute_unit_limit_instruction(priority_fee_cu_limit));
+        }
         payload_ixs.push(compute_unit_price_instruction(priority_fee_microlamports));
     }
     payload_ixs.push(memo_instruction(memo));
@@ -1425,6 +1461,7 @@ impl<G: BundleGateway> BundleSubmitter<G> {
             &memo,
             self.config.self_transfer_lamports,
             spec.priority_fee_microlamports,
+            spec.priority_fee_cu_limit,
             tip_lamports,
             &tip_account,
             blockhash,
@@ -1614,13 +1651,24 @@ mod tests {
     }
 
     #[test]
+    fn compute_unit_limit_instruction_encoding() {
+        // SetComputeUnitLimit = discriminant 2 + u32 LE units, no accounts.
+        let ix = compute_unit_limit_instruction(10_000);
+        assert_eq!(ix.program_id, compute_budget_program_id());
+        assert!(ix.accounts.is_empty());
+        assert_eq!(ix.data.len(), 5);
+        assert_eq!(ix.data[0], 2);
+        assert_eq!(&ix.data[1..5], &10_000u32.to_le_bytes());
+    }
+
+    #[test]
     fn build_bundle_adds_priority_fee_only_when_nonzero() {
         let kp = Keypair::new();
         let tip_account = Pubkey::new_unique();
         let blockhash = Hash::new_unique();
 
         // priority_fee = 0 -> tx0 is just [memo, self-transfer]; no compute budget.
-        let plain = build_bundle(&kp, "m", 1_000, 0, 5_000, &tip_account, blockhash).unwrap();
+        let plain = build_bundle(&kp, "m", 1_000, 0, 0, 5_000, &tip_account, blockhash).unwrap();
         let tx0 = decode_bundle_tx(&plain.memo_base64).unwrap();
         assert_eq!(tx0.instructions.len(), 2);
         assert_eq!(tx0.instructions[0].program_id, memo_program_id());
@@ -1629,13 +1677,15 @@ mod tests {
             .iter()
             .all(|ix| ix.program_id != compute_budget_program_id()));
 
-        // priority_fee > 0 -> tx0 = [compute-budget price, memo, self-transfer].
-        let bam = build_bundle(&kp, "m", 1_000, 7_500, 5_000, &tip_account, blockhash).unwrap();
+        // priority_fee + cu_limit > 0 -> tx0 = [CU limit, CU price, memo, self-transfer].
+        let bam = build_bundle(&kp, "m", 1_000, 7_500, 10_000, 5_000, &tip_account, blockhash).unwrap();
         let tx0 = decode_bundle_tx(&bam.memo_base64).unwrap();
-        assert_eq!(tx0.instructions.len(), 3);
+        assert_eq!(tx0.instructions.len(), 4);
         assert_eq!(tx0.instructions[0].program_id, compute_budget_program_id());
-        assert_eq!(tx0.instructions[0].data_len, 9);
-        assert_eq!(tx0.instructions[1].program_id, memo_program_id());
+        assert_eq!(tx0.instructions[0].data_len, 5); // SetComputeUnitLimit (u32)
+        assert_eq!(tx0.instructions[1].program_id, compute_budget_program_id());
+        assert_eq!(tx0.instructions[1].data_len, 9); // SetComputeUnitPrice (u64)
+        assert_eq!(tx0.instructions[2].program_id, memo_program_id());
         // The tip tx is unchanged regardless of priority fee.
         assert!(bundle_has_valid_tip(
             &[bam.memo_base64.clone(), bam.tip_base64.clone()],
@@ -1643,6 +1693,14 @@ mod tests {
             5_000,
             &kp.pubkey()
         ));
+
+        // priority_fee > 0 but cu_limit = 0 -> price only, no limit instruction.
+        let no_limit =
+            build_bundle(&kp, "m", 1_000, 7_500, 0, 5_000, &tip_account, blockhash).unwrap();
+        let tx0 = decode_bundle_tx(&no_limit.memo_base64).unwrap();
+        assert_eq!(tx0.instructions.len(), 3);
+        assert_eq!(tx0.instructions[0].program_id, compute_budget_program_id());
+        assert_eq!(tx0.instructions[0].data_len, 9); // price only
     }
 
     // --- pure construction ---
@@ -1653,7 +1711,7 @@ mod tests {
         let tip_account = Pubkey::new_unique();
         let blockhash = Hash::new_unique();
 
-        let built = build_bundle(&kp, "hello", 1_000, 0, 10_000, &tip_account, blockhash).unwrap();
+        let built = build_bundle(&kp, "hello", 1_000, 0, 0, 10_000, &tip_account, blockhash).unwrap();
 
         // Both txs anchored on the same blockhash.
         assert_eq!(built.memo_tx.message.recent_blockhash, blockhash);
@@ -1692,7 +1750,7 @@ mod tests {
         let blockhash = Hash::new_unique();
         let tip = 12_345u64;
 
-        let built = build_bundle(&kp, "m", 1_000, 0, tip, &tip_account, blockhash).unwrap();
+        let built = build_bundle(&kp, "m", 1_000, 0, 0, tip, &tip_account, blockhash).unwrap();
 
         let msg = &built.tip_tx.message;
         let ci = &msg.instructions[0];
@@ -1718,7 +1776,7 @@ mod tests {
         let blockhash = Hash::new_unique();
         let tip = 12_623u64; // the lamport amount from the failing live run
 
-        let built = build_bundle(&kp, "stx:diag", 1_000, 0, tip, &tip_account, blockhash).unwrap();
+        let built = build_bundle(&kp, "stx:diag", 1_000, 0, 0, tip, &tip_account, blockhash).unwrap();
         // Decode exactly what gets sent (base64 -> bincode -> Transaction).
         let txs = vec![built.memo_base64.clone(), built.tip_base64.clone()];
 
@@ -1773,7 +1831,7 @@ mod tests {
         let blockhash = Hash::new_unique();
 
         // Sub-1000 tip -> not a valid Jito tip even though structurally a transfer.
-        let low = build_bundle(&kp, "m", 1_000, 0, 500, &tip_account, blockhash).unwrap();
+        let low = build_bundle(&kp, "m", 1_000, 0, 0, 500, &tip_account, blockhash).unwrap();
         let low_txs = vec![low.memo_base64, low.tip_base64];
         assert!(!bundle_has_valid_tip(&low_txs, &tip_account, 500, &payer));
         // The transfer is still decodable (proving the check is min-aware, not blind).
@@ -1786,7 +1844,7 @@ mod tests {
         );
 
         // Wrong destination -> not detected as a valid tip to the expected account.
-        let good = build_bundle(&kp, "m", 1_000, 0, 5_000, &tip_account, blockhash).unwrap();
+        let good = build_bundle(&kp, "m", 1_000, 0, 0, 5_000, &tip_account, blockhash).unwrap();
         let good_txs = vec![good.memo_base64, good.tip_base64];
         let some_other_account = Pubkey::new_unique();
         assert!(!bundle_has_valid_tip(&good_txs, &some_other_account, 5_000, &payer));
@@ -2121,6 +2179,7 @@ mod tests {
             tip_lamports: tip,
             memo_text: memo.to_string(),
             priority_fee_microlamports: 0,
+            priority_fee_cu_limit: 0,
             #[cfg(feature = "fault-injection")]
             fault: None,
         }
@@ -2211,6 +2270,7 @@ mod tests {
             tip_lamports: 50_000,
             memo_text: "x".to_string(),
             priority_fee_microlamports: 0,
+            priority_fee_cu_limit: 0,
             fault: Some(Fault::SubFloorTip { lamports: 500 }),
         };
         let record = submitter.submit(spec, 7).await.unwrap();
@@ -2236,6 +2296,7 @@ mod tests {
             tip_lamports: 50_000,
             memo_text: "x".to_string(),
             priority_fee_microlamports: 0,
+            priority_fee_cu_limit: 0,
             fault: Some(Fault::StaleBlockhash { age_slots: 100 }),
         };
         let record = submitter.submit(spec, 9).await.unwrap();

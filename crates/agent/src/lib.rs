@@ -39,6 +39,7 @@ Domain facts:
 - A Jito bundle is atomic: all of its transactions land together in a single leader's slot, or none of them do.
 - Bundles can only land during slots led by Jito-enabled validators. If such a leader slot is skipped or missed, a perfectly valid, well-tipped bundle simply never lands and the right move may be to wait.
 - Some failures happen BEFORE the bundle ever reaches the auction: a tip-account fetch failure, a sendBundle network/transport error, or an empty/malformed Block Engine response. These are classified as TransportError. When the failure kind is TransportError, the bundle, its blockhash, and its tip are NOT the cause — the infrastructure was unreachable. The only correct responses are to hold (wait for the infrastructure to recover) and then resubmit, or to abandon after repeated failures. Do NOT raise the tip and do NOT refresh the blockhash for a TransportError — nothing about the bundle caused it.
+- AuctionLost means the Block Engine ACCEPTED the bundle (it returned a bundle_id) but the bundle never won its auction / never landed — often confirmed by Jito's getInflightBundleStatuses returning Invalid. The bundle was well-formed; it simply lost. By the time this is detected the blockhash IS stale (it aged while the bundle sat unlanded — a downstream symptom, not the original cause). The right move is usually to refresh the blockhash and resubmit to compete for the next Jito leader, optionally raising the tip if you were near or below the prevailing percentile; abandon after repeated losses. Do NOT describe this as an expired blockhash — the root cause is the lost auction.
 
 Allowed actions:
 - refresh_blockhash: fetch a fresh blockhash and rebuild (the blockhash is expired or aging).
@@ -275,6 +276,16 @@ impl BaselineAgent {
             ComputeExceeded => vec![Action::Abandon],
             BundleFailure => {
                 if ctx.attempt <= 2 {
+                    vec![Action::RefreshBlockhash, Action::Resubmit]
+                } else {
+                    vec![Action::Abandon]
+                }
+            }
+            // Lost the auction (accepted but never won / Jito Invalid). The bundle
+            // itself is fine; by timeout its blockhash IS stale, so refresh and
+            // resubmit to compete for the next leader. Give up after a few tries.
+            AuctionLost => {
+                if ctx.attempt <= 3 {
                     vec![Action::RefreshBlockhash, Action::Resubmit]
                 } else {
                     vec![Action::Abandon]
@@ -735,6 +746,16 @@ mod tests {
     }
 
     #[test]
+    fn baseline_auction_lost_refreshes_blockhash_and_resubmits_then_abandons() {
+        // Lost the auction: blockhash is stale by now, so refresh + resubmit to
+        // compete for the next leader; abandon after repeated losses.
+        let retry = BaselineAgent.decide_sync(&ctx(FailureKind::AuctionLost, 3, 10_000, None));
+        assert_eq!(retry.actions, vec![Action::RefreshBlockhash, Action::Resubmit]);
+        let give_up = BaselineAgent.decide_sync(&ctx(FailureKind::AuctionLost, 4, 10_000, None));
+        assert_eq!(give_up.actions, vec![Action::Abandon]);
+    }
+
+    #[test]
     fn baseline_transport_error_holds_then_resubmits_no_tip_change() {
         // Hold + resubmit while attempts <= 3; no tip change, no blockhash refresh.
         let early = BaselineAgent.decide_sync(&ctx(FailureKind::TransportError, 3, 10_000, Some(99)));
@@ -842,6 +863,7 @@ Domain facts:
 - A Jito bundle is atomic: all of its transactions land together in a single leader's slot, or none of them do.
 - Bundles can only land during slots led by Jito-enabled validators. If such a leader slot is skipped or missed, a perfectly valid, well-tipped bundle simply never lands and the right move may be to wait.
 - Some failures happen BEFORE the bundle ever reaches the auction: a tip-account fetch failure, a sendBundle network/transport error, or an empty/malformed Block Engine response. These are classified as TransportError. When the failure kind is TransportError, the bundle, its blockhash, and its tip are NOT the cause — the infrastructure was unreachable. The only correct responses are to hold (wait for the infrastructure to recover) and then resubmit, or to abandon after repeated failures. Do NOT raise the tip and do NOT refresh the blockhash for a TransportError — nothing about the bundle caused it.
+- AuctionLost means the Block Engine ACCEPTED the bundle (it returned a bundle_id) but the bundle never won its auction / never landed — often confirmed by Jito's getInflightBundleStatuses returning Invalid. The bundle was well-formed; it simply lost. By the time this is detected the blockhash IS stale (it aged while the bundle sat unlanded — a downstream symptom, not the original cause). The right move is usually to refresh the blockhash and resubmit to compete for the next Jito leader, optionally raising the tip if you were near or below the prevailing percentile; abandon after repeated losses. Do NOT describe this as an expired blockhash — the root cause is the lost auction.
 
 Allowed actions:
 - refresh_blockhash: fetch a fresh blockhash and rebuild (the blockhash is expired or aging).

@@ -39,6 +39,51 @@ pub enum FailureKind {
     /// response *before* the bundle was accepted. The bundle, blockhash, and tip
     /// are not implicated — the infrastructure was unreachable.
     TransportError,
+    /// The bundle was accepted by the Block Engine (a `bundle_id` was returned)
+    /// but never won its auction / never landed — confirmed by Jito's
+    /// `getInflightBundleStatuses` returning `Invalid`/`Failed`, or inferred when a
+    /// bundle with a valid-at-submission blockhash and a competitive tip simply
+    /// never landed. The blockhash aging past validity afterwards is a *downstream
+    /// symptom* of sitting unlanded, NOT the cause — so this is distinct from
+    /// [`ExpiredBlockhash`](Self::ExpiredBlockhash).
+    AuctionLost,
+}
+
+/// The last Jito `getInflightBundleStatuses` verdict observed for a bundle, as
+/// seen by the classifier. Mirrors `submitter::BundleStatus` but kept independent
+/// so the `failure` crate has no dependency on `submitter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JitoInflight {
+    /// `getInflightBundleStatuses` returned `Invalid` — not in Jito's system /
+    /// never entered the auction (definitive auction loss).
+    Invalid,
+    /// `Failed` — all regions failed/expired or it landed elsewhere (lost).
+    Failed,
+    /// `Pending` — was in the system but had not been processed when last polled.
+    Pending,
+    /// `Landed` — Jito reported it on-chain (should not normally reach NeverLanded).
+    Landed,
+    /// Polled but the status string was unrecognized.
+    Unknown,
+    /// Never polled / no status recorded for this bundle.
+    NotPolled,
+}
+
+impl JitoInflight {
+    /// Map a recorded status string (e.g. from the bundle-status poller, or the
+    /// persisted `jito_inflight_status` column) onto the enum. `None`/empty →
+    /// `NotPolled`.
+    pub fn from_status_str(s: Option<&str>) -> Self {
+        match s.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if v == "invalid" => Self::Invalid,
+            Some(v) if v == "failed" => Self::Failed,
+            Some(v) if v == "pending" => Self::Pending,
+            Some(v) if v == "landed" => Self::Landed,
+            Some(v) if v.is_empty() => Self::NotPolled,
+            Some(_) => Self::Unknown,
+            None => Self::NotPolled,
+        }
+    }
 }
 
 /// Heterogeneous evidence handed to the classifier.
@@ -53,7 +98,8 @@ pub enum Evidence {
     /// hex-encoded bincode `TransactionError` carried by the stream crate.
     OnChainError { raw_error_hex: String, slot: u64 },
     /// The bundle was submitted but never observed landing. The probabilistic
-    /// door — we infer the most plausible cause from slot/tip context.
+    /// door — we infer the most plausible cause from slot/tip context and the
+    /// last Jito inflight status.
     NeverLanded {
         submitted_slot: u64,
         blockhash_fetched_at_slot: u64,
@@ -61,6 +107,9 @@ pub enum Evidence {
         tip_lamports: u64,
         tip_p50_at_submit: Option<u64>,
         tip_p75_at_submit: Option<u64>,
+        /// Last `getInflightBundleStatuses` verdict from the bundle-status poller.
+        /// `Invalid`/`Failed` is direct evidence the bundle lost its auction.
+        jito_inflight: JitoInflight,
     },
 }
 
@@ -105,6 +154,7 @@ pub fn classify(evidence: &Evidence) -> Classification {
             tip_lamports,
             tip_p50_at_submit,
             tip_p75_at_submit,
+            jito_inflight,
         } => classify_never_landed(
             *submitted_slot,
             *blockhash_fetched_at_slot,
@@ -112,6 +162,7 @@ pub fn classify(evidence: &Evidence) -> Classification {
             *tip_lamports,
             *tip_p50_at_submit,
             *tip_p75_at_submit,
+            *jito_inflight,
         ),
     }
 }
@@ -272,16 +323,35 @@ fn map_tx_error(tx_error: &TransactionError, slot: u64) -> Classification {
 // 3. NeverLanded — the probabilistic door
 // ---------------------------------------------------------------------------
 
+/// Classify a never-landed timeout. Priority is chosen so the *root cause* is
+/// named, never a downstream symptom:
+///
+/// 1. **Blockhash stale AT submission** (`submitted - fetched > validity`): a real
+///    `ExpiredBlockhash` — we shipped an already-expired hash.
+/// 2. **Tip below p50 at submit**: `FeeTooLow` — outbid (actionable: raise tip).
+/// 3. **Jito inflight `Invalid`/`Failed`**: `AuctionLost` — the Block Engine
+///    accepted the bundle (issued a `bundle_id`) but it never won/entered.
+/// 4. Otherwise (valid-at-submit blockhash, competitive tip, not confirmed
+///    Invalid): `AuctionLost` (inferred) — never landed despite being well-formed.
+///
+/// Critically, a blockhash that only aged past validity *while the bundle sat
+/// unlanded* is a symptom of (3)/(4), NOT `ExpiredBlockhash` — that was the bug.
 fn classify_never_landed(
-    _submitted_slot: u64,
+    submitted_slot: u64,
     blockhash_fetched_at_slot: u64,
     last_observed_slot: u64,
     tip_lamports: u64,
     tip_p50_at_submit: Option<u64>,
     tip_p75_at_submit: Option<u64>,
+    jito_inflight: JitoInflight,
 ) -> Classification {
-    let blockhash_age = last_observed_slot.saturating_sub(blockhash_fetched_at_slot);
-    let expired_in_play = blockhash_age > BLOCKHASH_VALIDITY_SLOTS;
+    // Genuine expiry: the hash was ALREADY past validity when we submitted.
+    let age_at_submit = submitted_slot.saturating_sub(blockhash_fetched_at_slot);
+    let expired_at_submission = age_at_submit > BLOCKHASH_VALIDITY_SLOTS;
+
+    // Downstream symptom: aged past validity only while waiting to land.
+    let age_at_last = last_observed_slot.saturating_sub(blockhash_fetched_at_slot);
+    let aged_while_waiting = age_at_last > BLOCKHASH_VALIDITY_SLOTS;
 
     // "Outbid": the tip was strictly below the median (p50) at submit time.
     let tip_below_p50 = tip_p50_at_submit
@@ -289,57 +359,81 @@ fn classify_never_landed(
         .unwrap_or(false);
 
     let tip_ctx = tip_context(tip_lamports, tip_p50_at_submit, tip_p75_at_submit);
-    let age_ctx = format!(
-        "blockhash {blockhash_age} slots old at last observation \
-         (fetched at slot {blockhash_fetched_at_slot}, last seen {last_observed_slot}, \
-         validity ~{BLOCKHASH_VALIDITY_SLOTS})"
-    );
+    let aged_symptom = if aged_while_waiting {
+        format!(
+            " (its blockhash later aged to {age_at_last} slots, past ~{BLOCKHASH_VALIDITY_SLOTS} \
+             — a downstream symptom of sitting unlanded, not the cause)"
+        )
+    } else {
+        String::new()
+    };
 
-    match (expired_in_play, tip_below_p50) {
-        // Exactly one signal in play -> that kind, Likely.
-        (true, false) => Classification {
+    // 1. Blockhash stale AT submission -> genuine ExpiredBlockhash.
+    if expired_at_submission {
+        return Classification {
             kind: FailureKind::ExpiredBlockhash,
-            confidence: Confidence::Likely,
-            rationale: format!("never landed: {age_ctx}; {tip_ctx} — blockhash likely expired"),
-        },
-        (false, true) => Classification {
+            confidence: Confidence::Certain,
+            rationale: format!(
+                "never landed: blockhash was ALREADY {age_at_submit} slots old at submission \
+                 (fetched slot {blockhash_fetched_at_slot}, submitted slot {submitted_slot}, \
+                 validity ~{BLOCKHASH_VALIDITY_SLOTS}) — stale before it ever reached the auction; \
+                 {tip_ctx}"
+            ),
+        };
+    }
+
+    // 2. Sub-market tip -> outbid (actionable: raise the tip).
+    if tip_below_p50 {
+        let p50 = tip_p50_at_submit.expect("tip_below_p50 implies p50 is Some");
+        return Classification {
             kind: FailureKind::FeeTooLow,
             confidence: Confidence::Likely,
-            rationale: format!("never landed: {tip_ctx} — likely outbid; {age_ctx}"),
-        },
+            rationale: format!(
+                "never landed: {tip_ctx} — tip below p50 {p50} (under market) is the likely root \
+                 cause (outbid in the auction){aged_symptom}"
+            ),
+        };
+    }
 
-        // Both in play (tip under market AND blockhash aged out): the sub-market
-        // tip is the likely ROOT CAUSE (auction loss) — the bundle never landed,
-        // so its blockhash aging past the validity window is a downstream
-        // *symptom*, not the cause. Favor FeeTooLow; list ExpiredBlockhash as the
-        // alternative.
-        (true, true) => {
-            let p50 = tip_p50_at_submit.expect("tip_below_p50 implies p50 is Some");
+    // 3 & 4. Lost the auction: either Jito confirms it (Invalid/Failed) or we infer
+    // it (competitive tip + valid-at-submit blockhash, yet it never landed).
+    let jito_ctx = "block engine accepted the bundle (a bundle_id was returned)";
+    match jito_inflight {
+        JitoInflight::Invalid => Classification {
+            kind: FailureKind::AuctionLost,
+            confidence: Confidence::Certain,
+            rationale: format!(
+                "never landed: {jito_ctx} but getInflightBundleStatuses returned Invalid — the \
+                 bundle is not in Jito's system / never entered its auction; it did not win. \
+                 {tip_ctx}{aged_symptom}"
+            ),
+        },
+        JitoInflight::Failed => Classification {
+            kind: FailureKind::AuctionLost,
+            confidence: Confidence::Likely,
+            rationale: format!(
+                "never landed: {jito_ctx} but getInflightBundleStatuses returned Failed (all \
+                 regions failed/expired or it landed elsewhere) — it lost its auction. \
+                 {tip_ctx}{aged_symptom}"
+            ),
+        },
+        // No definitive Invalid/Failed signal: infer auction loss from the fact
+        // that a well-formed bundle (valid-at-submit blockhash, competitive tip)
+        // still never landed.
+        JitoInflight::Pending | JitoInflight::Landed | JitoInflight::Unknown | JitoInflight::NotPolled => {
             Classification {
-                kind: FailureKind::FeeTooLow,
+                kind: FailureKind::AuctionLost,
                 confidence: Confidence::Ambiguous {
-                    alternatives: vec![FailureKind::ExpiredBlockhash],
+                    alternatives: vec![FailureKind::BundleFailure],
                 },
                 rationale: format!(
-                    "never landed: {tip_ctx} — tip below p50 {p50} (under market) is the likely \
-                     root cause (auction loss); the blockhash also aged out ({age_ctx}) as a \
-                     downstream consequence of never landing"
+                    "never landed though the blockhash was valid at submission and the tip was \
+                     competitive: {tip_ctx} — most likely lost the auction (or a skipped/dropped \
+                     Jito leader slot); getInflightBundleStatuses was not a definitive \
+                     Invalid/Failed when last polled{aged_symptom}"
                 ),
             }
         }
-
-        // Neither in play: it vanished while the blockhash was valid and the tip
-        // was competitive — most likely a skipped/missed Jito leader slot.
-        (false, false) => Classification {
-            kind: FailureKind::BundleFailure,
-            confidence: Confidence::Ambiguous {
-                alternatives: Vec::new(),
-            },
-            rationale: format!(
-                "never landed though blockhash was valid and tip competitive: {age_ctx}; \
-                 {tip_ctx} — possibly a skipped/missed Jito leader slot or dropped bundle"
-            ),
-        },
     }
 }
 
@@ -650,6 +744,9 @@ mod tests {
 
     // --- 3. NeverLanded ---
 
+    /// Blockhash was FRESH at submission (submitted_slot == fetched), so any age
+    /// accrues only while waiting — i.e. a downstream symptom, never genuine
+    /// ExpiredBlockhash. Jito status defaults to NotPolled.
     fn never_landed(
         blockhash_fetched_at_slot: u64,
         last_observed_slot: u64,
@@ -657,29 +754,116 @@ mod tests {
         p50: Option<u64>,
         p75: Option<u64>,
     ) -> Evidence {
+        never_landed_full(
+            blockhash_fetched_at_slot,
+            blockhash_fetched_at_slot,
+            last_observed_slot,
+            tip,
+            p50,
+            p75,
+            JitoInflight::NotPolled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn never_landed_full(
+        submitted_slot: u64,
+        blockhash_fetched_at_slot: u64,
+        last_observed_slot: u64,
+        tip: u64,
+        p50: Option<u64>,
+        p75: Option<u64>,
+        jito_inflight: JitoInflight,
+    ) -> Evidence {
         Evidence::NeverLanded {
-            submitted_slot: blockhash_fetched_at_slot,
+            submitted_slot,
             blockhash_fetched_at_slot,
             last_observed_slot,
             tip_lamports: tip,
             tip_p50_at_submit: p50,
             tip_p75_at_submit: p75,
+            jito_inflight,
         }
     }
 
     #[test]
-    fn never_landed_expired_only() {
-        // age = 1000 - 800 = 200 (> 150), tip competitive (== p50, not below).
-        let c = classify(&never_landed(800, 1000, 5000, Some(5000), Some(8000)));
-        assert_eq!(c.kind, FailureKind::ExpiredBlockhash);
+    fn never_landed_invalid_status_competitive_tip_is_auction_lost() {
+        // THE FIX: never-landed + Jito getInflightBundleStatuses=Invalid +
+        // competitive tip (6000 >= p50 5000) + blockhash that only aged while
+        // waiting -> AuctionLost (Certain), NOT ExpiredBlockhash.
+        let c = classify(&never_landed_full(
+            1000,
+            1000,
+            1200,
+            6_000,
+            Some(5_000),
+            Some(5_500),
+            JitoInflight::Invalid,
+        ));
+        assert_eq!(c.kind, FailureKind::AuctionLost);
+        assert_eq!(c.confidence, Confidence::Certain);
+        assert_ne!(c.kind, FailureKind::ExpiredBlockhash);
+        assert!(c.rationale.contains("Invalid"));
+        assert!(c.rationale.contains("bundle_id"));
+        // The aged blockhash is named as a downstream symptom, not the cause.
+        assert!(c.rationale.to_lowercase().contains("symptom"));
+    }
+
+    #[test]
+    fn never_landed_failed_status_is_auction_lost_likely() {
+        let c = classify(&never_landed_full(
+            0,
+            0,
+            50,
+            6_000,
+            Some(5_000),
+            None,
+            JitoInflight::Failed,
+        ));
+        assert_eq!(c.kind, FailureKind::AuctionLost);
         assert_eq!(c.confidence, Confidence::Likely);
-        assert!(c.rationale.contains("200 slots old"));
-        assert!(c.rationale.contains("validity ~150"));
+        assert!(c.rationale.contains("Failed"));
+    }
+
+    #[test]
+    fn never_landed_expired_at_submission_is_expired_blockhash() {
+        // Blockhash was ALREADY 200 slots old at submission (submitted 200, fetched
+        // 0) -> genuine ExpiredBlockhash / Certain, even with Invalid status.
+        let c = classify(&never_landed_full(
+            200,
+            0,
+            260,
+            6_000,
+            Some(5_000),
+            None,
+            JitoInflight::Invalid,
+        ));
+        assert_eq!(c.kind, FailureKind::ExpiredBlockhash);
+        assert_eq!(c.confidence, Confidence::Certain);
+        assert!(c.rationale.contains("ALREADY"));
+        assert!(c.rationale.contains("before it ever reached the auction"));
+    }
+
+    #[test]
+    fn never_landed_competitive_tip_aged_while_waiting_is_auction_lost() {
+        // Tip competitive (6000 >= p50 5000), blockhash valid at submit but aged to
+        // 200 while waiting. This is the live-run bug: it used to be ExpiredBlockhash,
+        // now AuctionLost (the expiry is a downstream symptom of never landing).
+        let c = classify(&never_landed(0, 200, 6_000, Some(5_000), Some(5_500)));
+        assert_eq!(c.kind, FailureKind::AuctionLost);
+        assert_ne!(c.kind, FailureKind::ExpiredBlockhash);
+        assert_eq!(
+            c.confidence,
+            Confidence::Ambiguous {
+                alternatives: vec![FailureKind::BundleFailure]
+            }
+        );
+        assert!(c.rationale.to_lowercase().contains("symptom"));
     }
 
     #[test]
     fn never_landed_fee_only() {
-        // age = 50 (< 150), tip 100 < p50 1000.
+        // age = 50 (< 150), tip 100 < p50 1000 -> outbid -> FeeTooLow.
         let c = classify(&never_landed(1000, 1050, 100, Some(1000), Some(2000)));
         assert_eq!(c.kind, FailureKind::FeeTooLow);
         assert_eq!(c.confidence, Confidence::Likely);
@@ -688,21 +872,15 @@ mod tests {
     }
 
     #[test]
-    fn never_landed_aged_blockhash_but_sub_p50_tip_blames_fee() {
-        // Sub-p50 tip (900 < 1000) AND aged blockhash (400 > 150): the sub-market
-        // tip is the root cause; expiry is a downstream symptom -> FeeTooLow, with
-        // ExpiredBlockhash as the alternative (this is the live-run bug being fixed:
-        // it used to classify as ExpiredBlockhash).
+    fn never_landed_sub_p50_tip_aged_while_waiting_blames_fee_not_expiry() {
+        // Sub-p50 tip (900 < 1000) AND blockhash aged to 400 while waiting: the
+        // sub-market tip is the actionable root cause -> FeeTooLow / Likely, with
+        // the expiry named only as a downstream symptom (NOT ExpiredBlockhash).
         let c = classify(&never_landed(0, 400, 900, Some(1000), None));
         assert_eq!(c.kind, FailureKind::FeeTooLow);
-        assert_eq!(
-            c.confidence,
-            Confidence::Ambiguous {
-                alternatives: vec![FailureKind::ExpiredBlockhash]
-            }
-        );
+        assert_eq!(c.confidence, Confidence::Likely);
         assert!(c.rationale.contains("root cause"));
-        assert!(c.rationale.contains("consequence"));
+        assert!(c.rationale.to_lowercase().contains("symptom"));
     }
 
     #[test]
@@ -716,74 +894,53 @@ mod tests {
     }
 
     #[test]
-    fn never_landed_competitive_tip_aged_blockhash_is_expired_likely() {
-        // Tip at/above market (6000 >= p50 5000) AND blockhash aged past 150 ->
-        // ExpiredBlockhash / Likely (tip is not implicated).
-        let c = classify(&never_landed(0, 200, 6_000, Some(5_000), Some(5_500)));
-        assert_eq!(c.kind, FailureKind::ExpiredBlockhash);
-        assert_eq!(c.confidence, Confidence::Likely);
-    }
-
-    #[test]
-    fn never_landed_both_fee_more_severe() {
-        // age = 160 (overage 10 -> sev 0.067); tip 100 vs p50 1000 (sev 0.90).
-        let c = classify(&never_landed(0, 160, 100, Some(1000), None));
-        assert_eq!(c.kind, FailureKind::FeeTooLow);
-        assert_eq!(
-            c.confidence,
-            Confidence::Ambiguous {
-                alternatives: vec![FailureKind::ExpiredBlockhash]
-            }
-        );
-    }
-
-    #[test]
-    fn never_landed_neither_is_bundle_ambiguous_skipped_leader() {
-        // age = 100 (< 150), tip 5000 >= p50 5000.
+    fn never_landed_competitive_tip_fresh_blockhash_is_auction_lost() {
+        // age = 100 (< 150), tip 5000 >= p50 5000, no Invalid signal -> inferred
+        // AuctionLost (with BundleFailure as the alternative — skipped/dropped slot).
         let c = classify(&never_landed(900, 1000, 5000, Some(5000), Some(7000)));
-        assert_eq!(c.kind, FailureKind::BundleFailure);
+        assert_eq!(c.kind, FailureKind::AuctionLost);
         assert_eq!(
             c.confidence,
             Confidence::Ambiguous {
-                alternatives: vec![]
+                alternatives: vec![FailureKind::BundleFailure]
             }
         );
         assert!(c.rationale.to_lowercase().contains("leader"));
     }
 
     #[test]
-    fn never_landed_no_tip_reference_uses_only_blockhash() {
-        // No p50 -> fee can never be "in play"; only blockhash age matters.
+    fn never_landed_no_tip_reference_is_auction_lost_not_expiry() {
+        // No p50 -> fee never "in play". Blockhash fresh at submission in both
+        // cases, so neither is ExpiredBlockhash -> AuctionLost.
         let c = classify(&never_landed(0, 200, 1, None, None));
-        assert_eq!(c.kind, FailureKind::ExpiredBlockhash);
+        assert_eq!(c.kind, FailureKind::AuctionLost);
         let c2 = classify(&never_landed(0, 10, 1, None, None));
-        assert_eq!(c2.kind, FailureKind::BundleFailure);
+        assert_eq!(c2.kind, FailureKind::AuctionLost);
     }
 
-    // --- boundary: 149 / 150 / 151 slot ages ---
+    // --- boundary: aged-while-waiting no longer flips the KIND to ExpiredBlockhash ---
 
     #[test]
-    fn blockhash_age_boundaries() {
-        // Tip competitive throughout (>= p50), so only the age threshold moves.
+    fn aged_while_waiting_never_becomes_expired_blockhash() {
+        // Tip competitive; only the (waiting) age moves across the 150 threshold.
+        // The KIND stays AuctionLost throughout — expiry-while-waiting is a symptom.
         let competitive = (1000u64, Some(1000u64));
-
-        // age 149 -> not expired
-        let c149 = classify(&never_landed(0, 149, competitive.0, competitive.1, None));
-        assert_eq!(c149.kind, FailureKind::BundleFailure);
-        // age 150 -> NOT expired (strictly greater than required)
-        let c150 = classify(&never_landed(0, 150, competitive.0, competitive.1, None));
-        assert_eq!(c150.kind, FailureKind::BundleFailure);
-        // age 151 -> expired
-        let c151 = classify(&never_landed(0, 151, competitive.0, competitive.1, None));
-        assert_eq!(c151.kind, FailureKind::ExpiredBlockhash);
+        for age in [149u64, 150, 151, 300] {
+            let c = classify(&never_landed(0, age, competitive.0, competitive.1, None));
+            assert_eq!(
+                c.kind,
+                FailureKind::AuctionLost,
+                "age {age} should be AuctionLost, never ExpiredBlockhash"
+            );
+        }
     }
 
     #[test]
     fn tip_exactly_at_p50_is_not_fee_in_play() {
-        // tip == p50 -> not "below", so fee is not in play; blockhash valid ->
-        // neither -> BundleFailure.
+        // tip == p50 -> not "below", so fee is not in play; blockhash valid at
+        // submit -> AuctionLost (inferred).
         let c = classify(&never_landed(0, 10, 1000, Some(1000), None));
-        assert_eq!(c.kind, FailureKind::BundleFailure);
+        assert_eq!(c.kind, FailureKind::AuctionLost);
         // One lamport below -> fee in play.
         let c2 = classify(&never_landed(0, 10, 999, Some(1000), None));
         assert_eq!(c2.kind, FailureKind::FeeTooLow);

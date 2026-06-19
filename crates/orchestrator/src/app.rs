@@ -60,7 +60,12 @@ static REJECTION_SEQ: AtomicU64 = AtomicU64::new(0);
 /// runs out. Detached background task — this is a *diagnostic* signal straight
 /// from Jito (does the bundle enter the auction and Pending→Landed/Failed, or is
 /// it Invalid/never-entered?), independent of the on-chain lifecycle tracker.
-fn spawn_bundle_status_poll(submitter: Arc<BundleSubmitter<LiveGateway>>, bundle_id: String) {
+fn spawn_bundle_status_poll(
+    submitter: Arc<BundleSubmitter<LiveGateway>>,
+    lifecycle: LifecycleTracker,
+    bundle_db_id: i64,
+    bundle_id: String,
+) {
     tokio::spawn(async move {
         let start = std::time::Instant::now();
         let mut last: Option<String> = None;
@@ -69,6 +74,15 @@ fn spawn_bundle_status_poll(submitter: Arc<BundleSubmitter<LiveGateway>>, bundle
                 Ok(report) => {
                     let elapsed_ms = start.elapsed().as_millis();
                     let status = report.status.as_str().to_string();
+                    // Persist EVERY observed verdict so a later never-landed timeout
+                    // can classify AuctionLost (Jito Invalid) vs ExpiredBlockhash.
+                    if let Err(err) = lifecycle.record_jito_status(bundle_db_id, &status).await {
+                        warn!(
+                            bundle_db_id,
+                            error = %runtime::redact_url(&err.to_string()),
+                            "BUNDLE STATUS: failed to persist Jito status"
+                        );
+                    }
                     // Log every poll the first time we see a status, then only on
                     // change, so transitions stand out without spamming Pending.
                     if last.as_deref() != Some(status.as_str()) {
@@ -325,6 +339,7 @@ pub fn base_spec(tip: u64, memo: String) -> BundleSpec {
         tip_lamports: tip,
         memo_text: memo,
         priority_fee_microlamports: 0,
+        priority_fee_cu_limit: 0,
         #[cfg(feature = "fault-injection")]
         fault: None,
     }
@@ -899,15 +914,29 @@ impl App {
         // Auction-aware optimization: a BAM leader scores on (tips + priority_fees)
         // / CU, so when enabled we add a priority fee for BAM targets to stay
         // competitive. Non-BAM leaders (Block Engine, tips/CU) are unchanged.
-        spec.priority_fee_microlamports =
-            if window.is_bam && self.config.bam_priority_fee_enabled {
-                self.config.bam_priority_fee_microlamports
+        let apply_bam_fee = window.is_bam && self.config.bam_priority_fee_enabled;
+        spec.priority_fee_microlamports = if apply_bam_fee {
+            self.config.bam_priority_fee_microlamports
+        } else {
+            0
+        };
+        spec.priority_fee_cu_limit = if apply_bam_fee {
+            self.config.bam_priority_fee_cu_limit
+        } else {
+            0
+        };
+        if spec.priority_fee_microlamports > 0 {
+            // Estimated fee = ceil(price × limit / 1e6) when a CU limit is set.
+            let est_fee_lamports = if spec.priority_fee_cu_limit > 0 {
+                (spec.priority_fee_microlamports as u128 * spec.priority_fee_cu_limit as u128)
+                    .div_ceil(1_000_000) as u64
             } else {
                 0
             };
-        if spec.priority_fee_microlamports > 0 {
             info!(
                 priority_fee_microlamports = spec.priority_fee_microlamports,
+                cu_limit = spec.priority_fee_cu_limit,
+                est_priority_fee_lamports = est_fee_lamports,
                 "BAM leader — adding priority fee to compete in (tips + prio-fees)/CU auction"
             );
         }
@@ -978,7 +1007,12 @@ impl App {
                 // accepted bundle enters the auction (Pending) and what becomes of
                 // it (Landed / Failed / Invalid). Runs alongside the on-chain
                 // lifecycle tracking so we can compare the two.
-                spawn_bundle_status_poll(Arc::clone(&self.submitter), record.bundle_id.clone());
+                spawn_bundle_status_poll(
+                    Arc::clone(&self.submitter),
+                    self.lifecycle.clone(),
+                    row,
+                    record.bundle_id.clone(),
+                );
                 Ok(())
             }
             Err(err) => {
@@ -1095,6 +1129,9 @@ impl App {
             tip_lamports: row.tip_lamports,
             tip_p50_at_submit: row.tip_p50,
             tip_p75_at_submit: row.tip_p75,
+            jito_inflight: failure::JitoInflight::from_status_str(
+                row.jito_inflight_status.as_deref(),
+            ),
         };
         let classification = failure::classify(&evidence);
         warn!(
@@ -1114,21 +1151,28 @@ impl App {
     }
 
     async fn load_bundle_row(&self, id: i64) -> anyhow::Result<BundleRow> {
-        let (tip, p50, p75, bh_slot, sub_slot): (i64, Option<i64>, Option<i64>, i64, i64) =
-            sqlx::query_as(
-                "SELECT tip_lamports, tip_p50_at_submit, tip_p75_at_submit, \
-                 blockhash_fetched_at_slot, submitted_slot \
+        let (tip, p50, p75, bh_slot, sub_slot, jito): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            i64,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT tip_lamports, tip_p50_at_submit, tip_p75_at_submit, \
+                 blockhash_fetched_at_slot, submitted_slot, jito_inflight_status \
                  FROM bundle_submissions WHERE id = ?",
-            )
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await?;
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(BundleRow {
             tip_lamports: tip as u64,
             tip_p50: p50.map(|v| v as u64),
             tip_p75: p75.map(|v| v as u64),
             blockhash_fetched_at_slot: bh_slot as u64,
             submitted_slot: sub_slot as u64,
+            jito_inflight_status: jito,
         })
     }
 }
@@ -1139,6 +1183,7 @@ struct BundleRow {
     tip_p75: Option<u64>,
     blockhash_fetched_at_slot: u64,
     submitted_slot: u64,
+    jito_inflight_status: Option<String>,
 }
 
 /// Clear any injected fault on a spec (so agent retries are real submissions).
