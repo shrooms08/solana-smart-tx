@@ -144,9 +144,17 @@ because reversing it would require the cluster to abandon a block a supermajorit
 already endorsed.
 
 So the Processed → Confirmed delta is the time it takes for the rest of the
-cluster to see and vote on the block your transaction landed in. In this
-system's measurements the delta was on the order of ~800ms — roughly two slots —
-which matches the cluster taking a slot or two to propagate and vote.
+cluster to see and vote on the block your transaction landed in. With Solana
+slots at ~400ms, that delta is typically one to two slots — a few hundred
+milliseconds up to ~800ms — for the block to propagate and reach a supermajority
+vote. This stack instruments that delta per bundle (the `process_to_confirm_ms`
+column, stamped from the transaction-status stream), but it is honest about its
+own data: in the runs to date no contentless bundle won its Jito auction to land
+and exercise the Processed/Confirmed path, so that column is captured *by design*
+yet *unmeasured here*. The directly measured latency in this system is on the
+submission side — the hot-path send was driven from ~870ms to ~200ms (see
+[ARCHITECTURE.md](./ARCHITECTURE.md) §5); the commitment-transition deltas await
+a landing (see [FINDINGS.md](./FINDINGS.md)).
 
 The practical meaning: **Processed is a landing, not a guarantee.** For anything
 irreversible you wait for Confirmed (or Finalized); Processed tells you the
@@ -162,8 +170,10 @@ has expired and the transaction is rejected.
 
 The three commitment levels return blockhashes of different ages. A `processed`
 blockhash is the newest; a `confirmed` blockhash is a little older; a `finalized`
-blockhash is the oldest, because finalization lags the tip by roughly 31 slots
-(this system measured a finalize lag in that range). Fetching at `finalized`
+blockhash is the oldest, because finalization trails the chain tip by ~31–32
+slots — a fixed consequence of Solana's vote-lockout depth, not a tunable. (This
+stack relies on exactly that gap in its stale-blockhash fault, which fetches at
+`finalized` to manufacture an aged blockhash for the classifier.) Fetching at `finalized`
 therefore starts you tens of slots into the ~150-slot validity window before you
 have even built the transaction — you are spending a large fraction of your
 expiry budget on staleness you chose.
@@ -212,10 +222,16 @@ classifies real failures:
   never misread as a pricing or construction fault.
 - **FeeTooLow** — the tip was below what the auction required (the block engine
   returns an explicit minimum-tip message in some cases).
-- **ExpiredBlockhash** — the referenced blockhash aged out of the ~150-slot
-  window.
-- **NeverLanded** — accepted but never confirmed within the timeout window;
-  classified by weighing tip competitiveness before blaming the blockhash.
+- **ExpiredBlockhash** — the referenced blockhash was already aged out of the
+  ~150-slot window *at submission* (the genuine case, e.g. the stale-blockhash
+  fault) — not merely because time passed while a bundle sat unlanded.
+- **AuctionLost** — the block engine accepted the bundle (returned a `bundle_id`)
+  but it never won its auction, confirmed by `getInflightBundleStatuses` returning
+  `Invalid` (a `Certain` verdict) or inferred from a never-landed bundle with a
+  valid-at-submission blockhash and a competitive tip (`Ambiguous`). This is the
+  corrected classification for the central finding: a bundle that aged out *while
+  waiting* lost the auction; the expiry is a downstream symptom, not the cause —
+  so it is **not** reported as ExpiredBlockhash.
 
 For each classified failure, the AI agent decides the response (retry, raise the
 tip, refresh the blockhash, or abort), bounded by `max_attempts`. Every decision
@@ -235,11 +251,19 @@ log with:
 cargo run -p orchestrator -- export
 ```
 
-The exported log includes, per bundle: the bundle id, the memo signature (for
-cross-referencing on a block explorer), the tip paid, the target leader and
-slot, the commitment transitions with their slots and timestamps, the
-Processed → Confirmed → Finalized latency deltas, and — for failed bundles — the
-classified failure kind, the evidence, and the agent's decision.
+The exported log includes, per bundle: the bundle id, the memo signature, the tip
+paid (with the p50/p75 market context at submit), the target slot, the
+last Jito `getInflightBundleStatuses` verdict, the commitment transitions with
+their slots and timestamps, the Processed → Confirmed → Finalized latency deltas
+(populated when a bundle lands), and — for failed bundles — the classified failure
+kind, the confidence, the evidence, and the agent's decision and rationale. (The
+target *leader identity* and BAM flag are used at submit time but not persisted to
+the row, so they are not in the export.)
+
+A rendered, human-readable export of a real 58-bundle mainnet run is checked in as
+[LIFECYCLE_LOG.md](./LIFECYCLE_LOG.md), with `exports/lifecycle_log.json` as the
+machine-readable companion. Every bundle in it is `AuctionLost` — the finding in
+[FINDINGS.md](./FINDINGS.md), shown in the data.
 
 ---
 

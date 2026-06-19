@@ -212,19 +212,24 @@ for reconciliation after a gap, never as the primary signal.
 
 A pure classifier: given the evidence collected about a failed submission, it
 returns a `FailureKind` (expired blockhash, fee too low, compute exceeded,
-transport error, bundle failure, never-landed) with a confidence level and a
+transport error, bundle failure, **auction lost**) with a confidence level and a
 rationale. It holds no state and makes no network calls, which makes it
 exhaustively testable.
 
-**Design decision — classify from evidence, weigh competing causes.** A bundle
-that never landed and whose blockhash has since aged past 150 slots *looks* like
-an expired-blockhash failure — but if its tip was below the prevailing market
-rate, the more likely root cause is that it lost the auction, and the expiry is
-a downstream symptom. The classifier weighs tip-versus-percentile before blaming
-the blockhash, and when two causes are genuinely in play it returns an ambiguous
-classification naming both rather than a falsely confident single answer.
-Transport-level errors — including the block engine's rate-limit response — are
-checked first, so they are never misread as a tip or construction problem.
+**Design decision — classify from evidence, name the root cause, not the
+symptom.** A bundle that never landed and whose blockhash has since aged past 150
+slots *looks* like an expired-blockhash failure — but the blockhash only aged
+*because the bundle sat unlanded after losing its auction*. The expiry is a
+downstream symptom, not the cause. The classifier therefore reserves
+`ExpiredBlockhash` for a blockhash that was already stale *at submission*, and
+otherwise reaches for `AuctionLost`: with a `Certain` verdict when Jito's
+`getInflightBundleStatuses` (persisted by the bundle-status poller into the
+`jito_inflight_status` column) returned `Invalid`/`Failed`, and an `Ambiguous`
+one — naming `BundleFailure` as the alternative — when auction loss is only
+inferred from a valid-at-submission blockhash and a competitive tip. A sub-market
+tip is still called `FeeTooLow` (the actionable root cause). Transport-level
+errors — including the block engine's rate-limit response — are checked first, so
+they are never misread as a tip or construction problem.
 
 ### 3.7 `agent` — the operational decision
 
