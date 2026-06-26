@@ -51,14 +51,12 @@ Concretely, on every run the system:
 
 ```mermaid
 flowchart TB
-    subgraph EXT[External services]
+    subgraph SRC[External sources]
         direction LR
         YS[Yellowstone gRPC]
         KOBE[Jito validator API]
         RPC[Solana RPC]
         TIP[Jito tip-floor]
-        BE[Jito Block Engine]
-        ANTH[Anthropic API]
     end
 
     subgraph ING[Ingestion]
@@ -81,6 +79,12 @@ flowchart TB
         AGENT[agent]
     end
 
+    subgraph SINK[External sinks]
+        direction LR
+        BE[Jito Block Engine]
+        ANTH[Anthropic API]
+    end
+
     YS --> STREAM
     KOBE --> LEADER
     RPC --> LEADER
@@ -89,12 +93,12 @@ flowchart TB
     LEADER --> ORCH
     TIPS --> ORCH
     ORCH --> SUB
-    SUB --> BE
     SUB --> LIFE
     LIFE --> FAIL
     FAIL --> AGENT
-    AGENT --> ANTH
     AGENT -.decision.-> ORCH
+    SUB --> BE
+    AGENT --> ANTH
 ```
 
 The arrows are data, not control. The orchestrator owns the control loop; every
