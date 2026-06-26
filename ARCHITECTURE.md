@@ -50,38 +50,51 @@ Concretely, on every run the system:
 ## 2. System overview
 
 ```mermaid
-flowchart TD
-    subgraph ext[External services]
-        YS[Yellowstone gRPC<br/>slots + tx status]
-        KOBE[Jito validator API<br/>kobe.mainnet.jito.network]
-        RPC[Solana RPC<br/>blockhash, sig status, sim]
-        TIPWS[Jito tip-floor<br/>websocket + REST]
-        BE[Jito Block Engine<br/>sendBundle, status]
-        ANTH[Anthropic API<br/>failure reasoning]
+flowchart TB
+    subgraph EXT[External services]
+        direction LR
+        YS[Yellowstone gRPC]
+        KOBE[Jito validator API]
+        RPC[Solana RPC]
+        TIP[Jito tip-floor]
+        BE[Jito Block Engine]
+        ANTH[Anthropic API]
     end
 
-    YS --> STREAM[stream<br/>gRPC ingestion + reconnect]
-    KOBE --> LEADER[leader<br/>schedule ∩ Jito set]
+    subgraph ING[Ingestion]
+        direction LR
+        STREAM[stream]
+        LEADER[leader]
+        TIPS[tips]
+    end
+
+    subgraph CTRL[Control and submission]
+        direction LR
+        ORCH[orchestrator]
+        SUB[submitter]
+    end
+
+    subgraph TRK[Tracking and reasoning]
+        direction LR
+        LIFE[lifecycle]
+        FAIL[failure]
+        AGENT[agent]
+    end
+
+    YS --> STREAM
+    KOBE --> LEADER
     RPC --> LEADER
-    TIPWS --> TIPS[tips<br/>live tip percentiles]
-
-    STREAM -->|slot clock| LEADER
-    STREAM -->|tx status| LIFECYCLE[lifecycle<br/>commitment state machine]
-
-    LEADER -->|window open,<br/>is_bam| ORCH[orchestrator<br/>control loop]
-    TIPS -->|tip policy| ORCH
-    RPC -->|cached blockhash| SUBMITTER[submitter<br/>build + send bundle]
-
-    ORCH --> SUBMITTER
-    SUBMITTER -->|rate-limited,<br/>authenticated| BE
-    SUBMITTER -->|tracked| LIFECYCLE
-
-    LIFECYCLE -->|terminal failure| FAILURE[failure<br/>evidence-based classifier]
-    FAILURE -->|classification| AGENT[agent<br/>decision: retry / reprice / abort]
+    TIP --> TIPS
+    STREAM --> ORCH
+    LEADER --> ORCH
+    TIPS --> ORCH
+    ORCH --> SUB
+    SUB --> BE
+    SUB --> LIFE
+    LIFE --> FAIL
+    FAIL --> AGENT
     AGENT --> ANTH
-    AGENT -->|action| ORCH
-
-    LIFECYCLE -->|landed / never-landed| ORCH
+    AGENT -.decision.-> ORCH
 ```
 
 The arrows are data, not control. The orchestrator owns the control loop; every
