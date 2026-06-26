@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Transaction Stack — System Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#0b0e16;
+    --panel:#121826;
+    --panel-2:#171f30;
+    --card:#141b2a;
+    --line:#26314a;
+    --line-soft:#1c2436;
+    --text:#dbe2ef;
+    --muted:#8a97b3;
+    --faint:#5d6986;
+    --signal:#ffb454;     /* amber: the finding / the headline */
+    --data:#5ad6ec;       /* cyan: measurements */
+    --ok:#6fe3a4;         /* green: verified / correct */
+    --struck:#f0617a;     /* red: eliminated */
+    --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:'IBM Plex Sans',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    --rail:264px;
+    --measure:720px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+  body{
+    margin:0;
+    background:
+      linear-gradient(180deg,#0c1019 0%,#0b0e16 100%) fixed,
+      var(--ink);
+    color:var(--text);
+    font-family:var(--sans);
+    font-size:16px;
+    line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* subtle instrument grid */
+  body::before{
+    content:"";
+    position:fixed;inset:0;
+    background-image:
+      linear-gradient(var(--line-soft) 1px,transparent 1px),
+      linear-gradient(90deg,var(--line-soft) 1px,transparent 1px);
+    background-size:44px 44px;
+    opacity:.16;
+    pointer-events:none;
+    z-index:0;
+    mask-image:radial-gradient(ellipse 80% 60% at 50% 0%,#000 30%,transparent 100%);
+  }
+  a{color:inherit}
+  ::selection{background:rgba(255,180,84,.28)}
+
+  /* ---------- layout ---------- */
+  .wrap{position:relative;z-index:1;display:flex;gap:0;max-width:1180px;margin:0 auto}
+  .rail{
+    width:var(--rail);flex:0 0 var(--rail);
+    position:sticky;top:0;align-self:flex-start;height:100vh;
+    padding:34px 22px 28px 28px;
+    border-right:1px solid var(--line-soft);
+    display:flex;flex-direction:column;
+  }
+  .main{flex:1 1 auto;min-width:0;padding:0 48px 140px}
+  .col{max-width:var(--measure);margin:0 auto}
+
+  /* ---------- rail ---------- */
+  .brand{font-family:var(--mono);font-size:12.5px;letter-spacing:.02em;color:var(--text)}
+  .brand b{color:var(--signal);font-weight:600}
+  .brand .sub{display:block;margin-top:7px;color:var(--faint);font-size:11px;line-height:1.5}
+  .env{
+    margin-top:16px;display:inline-flex;align-items:center;gap:7px;
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;
+    color:var(--data);border:1px solid var(--line);border-radius:999px;
+    padding:4px 10px;text-transform:uppercase;
+  }
+  .env .dot{width:6px;height:6px;border-radius:50%;background:var(--data);box-shadow:0 0 8px var(--data)}
+  nav{margin-top:30px;overflow-y:auto;flex:1;-ms-overflow-style:none;scrollbar-width:thin}
+  nav ol{list-style:none;margin:0;padding:0;counter-reset:toc}
+  nav a{
+    display:flex;gap:11px;align-items:baseline;
+    font-family:var(--mono);font-size:12px;color:var(--muted);
+    text-decoration:none;padding:6px 0;border-left:2px solid transparent;
+    padding-left:12px;margin-left:-14px;transition:color .18s,border-color .18s;
+  }
+  nav a .n{color:var(--faint);font-size:11px;min-width:18px}
+  nav a:hover{color:var(--text)}
+  nav a.active{color:var(--signal);border-color:var(--signal)}
+  nav a.active .n{color:var(--signal)}
+  .rail-foot{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-top:18px;line-height:1.7}
+  .rail-foot a{color:var(--data);text-decoration:none}
+  .rail-foot a:hover{text-decoration:underline}
+
+  /* ---------- hero ---------- */
+  .hero{padding:84px 0 30px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--data);margin:0 0 20px}
+  h1{
+    font-family:var(--sans);font-weight:700;
+    font-size:clamp(34px,5.4vw,54px);line-height:1.04;letter-spacing:-.02em;
+    margin:0 0 22px;
+  }
+  h1 .thin{color:var(--muted);font-weight:400}
+  .lede{font-size:19px;line-height:1.6;color:#c4cde0;max-width:640px;margin:0 0 34px}
+  .lede b{color:var(--text);font-weight:600}
+  .meta-row{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:40px}
+  .tag{font-family:var(--mono);font-size:11.5px;color:var(--muted);border:1px solid var(--line);border-radius:6px;padding:6px 11px}
+  .tag b{color:var(--text);font-weight:500}
+
+  /* finding readout */
+  .readout{
+    border:1px solid var(--line);border-radius:14px;
+    background:linear-gradient(180deg,rgba(255,180,84,.05),rgba(255,180,84,0)) , var(--panel);
+    padding:24px 26px;position:relative;overflow:hidden;
+  }
+  .readout::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--signal)}
+  .readout .lab{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--signal);margin:0 0 10px}
+  .readout p{margin:0;font-size:16px;color:#cfd8ea}
+  .readout p b{color:#fff;font-weight:600}
+
+  /* ---------- sections ---------- */
+  section{padding:54px 0 0;scroll-margin-top:24px}
+  .sec-head{display:flex;align-items:baseline;gap:14px;margin:0 0 8px}
+  .sec-n{font-family:var(--mono);font-size:13px;color:var(--data);letter-spacing:.04em}
+  h2{font-family:var(--sans);font-weight:600;font-size:clamp(23px,3vw,30px);letter-spacing:-.01em;margin:0;line-height:1.15}
+  .rule{height:1px;background:var(--line-soft);margin:18px 0 26px}
+  h3{font-family:var(--sans);font-weight:600;font-size:18px;margin:30px 0 8px;letter-spacing:-.01em}
+  p{margin:0 0 16px}
+  p .m{font-family:var(--mono);font-size:.92em;color:var(--data);background:rgba(90,214,236,.08);padding:1px 6px;border-radius:5px}
+  strong{color:#eef2f9;font-weight:600}
+  .muted{color:var(--muted)}
+
+  ul.clean{list-style:none;margin:0 0 16px;padding:0}
+  ul.clean li{position:relative;padding-left:22px;margin-bottom:10px;color:#c8d1e3}
+  ul.clean li::before{content:"";position:absolute;left:2px;top:10px;width:7px;height:7px;border:1.5px solid var(--data);border-radius:2px;transform:rotate(45deg)}
+
+  ol.steps{counter-reset:s;list-style:none;margin:0 0 16px;padding:0}
+  ol.steps li{position:relative;padding-left:40px;margin-bottom:14px;color:#c8d1e3}
+  ol.steps li::before{
+    counter-increment:s;content:counter(s);
+    position:absolute;left:0;top:0;width:26px;height:26px;border-radius:7px;
+    background:var(--panel-2);border:1px solid var(--line);
+    font-family:var(--mono);font-size:12px;color:var(--data);
+    display:flex;align-items:center;justify-content:center;
+  }
+  ol.steps li b{color:#eef2f9}
+
+  /* ---------- system diagram ---------- */
+  .diagram{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:26px 22px;margin:8px 0 14px}
+  .tier{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
+  .tier + .arrow{display:flex;justify-content:center;color:var(--faint);font-family:var(--mono);font-size:14px;margin:10px 0;letter-spacing:.3em}
+  .tier-lab{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint);text-align:center;margin:0 0 9px}
+  .node{
+    border:1px solid var(--line);border-radius:9px;background:var(--card);
+    padding:10px 13px;min-width:118px;text-align:center;
+  }
+  .node .nm{font-family:var(--mono);font-size:12.5px;color:var(--text);font-weight:500}
+  .node .rl{font-size:10.5px;color:var(--faint);margin-top:3px;line-height:1.35}
+  .node.ext{background:transparent;border-style:dashed;border-color:var(--line-soft)}
+  .node.ext .nm{color:var(--muted);font-size:11px}
+  .node.core{border-color:var(--signal);background:linear-gradient(180deg,rgba(255,180,84,.08),transparent),var(--card)}
+  .node.core .nm{color:var(--signal)}
+  .node.send{border-color:rgba(90,214,236,.5)}
+  .node.send .nm{color:var(--data)}
+  .dgm-note{font-size:13.5px;color:var(--muted);margin:0}
+  .dgm-note b{color:var(--text)}
+
+  /* ---------- crate cards ---------- */
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:6px 0 8px}
+  .crate{border:1px solid var(--line);border-radius:12px;background:var(--card);padding:17px 18px}
+  .crate .cn{font-family:var(--mono);font-size:14px;color:var(--data);font-weight:500;margin-bottom:3px}
+  .crate .cr{font-size:13.5px;color:var(--muted);margin:0 0 11px;line-height:1.5}
+  .crate .dd{font-size:13px;color:#c8d1e3;border-top:1px solid var(--line-soft);padding-top:10px;line-height:1.55}
+  .crate .dd b{font-family:var(--mono);font-size:11px;letter-spacing:.04em;color:var(--signal);display:block;text-transform:uppercase;margin-bottom:4px;font-weight:600}
+
+  /* ---------- latency timeline (signature) ---------- */
+  .lat{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:24px 24px 20px;margin:6px 0 16px}
+  .lat-row{margin-bottom:20px}
+  .lat-row:last-child{margin-bottom:0}
+  .lat-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+  .lat-name{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+  .lat-val{font-family:var(--mono);font-size:13px;color:var(--text)}
+  .lat-val b{color:var(--signal)}
+  .bar{height:26px;border-radius:6px;display:flex;overflow:hidden;background:var(--line-soft);border:1px solid var(--line)}
+  .seg{height:100%;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:#0b0e16;white-space:nowrap;overflow:hidden}
+  .seg.rpc{background:#6b7794}
+  .seg.tls{background:var(--struck)}
+  .seg.prep{background:var(--data)}
+  .seg.send{background:var(--ok)}
+  .seg.lbl-light{color:#0b0e16;font-weight:600}
+  .lat-foot{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:14px;display:flex;flex-wrap:wrap;gap:16px}
+  .lat-foot span{display:inline-flex;align-items:center;gap:6px}
+  .chip{width:10px;height:10px;border-radius:2px;display:inline-block}
+
+  /* ---------- elimination log (signature) ---------- */
+  .elim{border:1px solid var(--line);border-radius:14px;background:var(--panel);overflow:hidden;margin:6px 0 14px}
+  .elim-h{display:flex;justify-content:space-between;align-items:center;padding:13px 18px;border-bottom:1px solid var(--line-soft);font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint)}
+  .elim-h .grn{color:var(--struck)}
+  .erow{display:grid;grid-template-columns:26px 1fr auto;gap:14px;align-items:start;padding:13px 18px;border-bottom:1px solid var(--line-soft)}
+  .erow:last-child{border-bottom:0}
+  .erow .led{width:9px;height:9px;border-radius:50%;background:var(--struck);box-shadow:0 0 7px rgba(240,97,122,.55);margin-top:7px;justify-self:center}
+  .erow .ttl{font-family:var(--mono);font-size:13px;color:var(--text)}
+  .erow .ev{font-size:13px;color:var(--muted);margin-top:3px;line-height:1.5}
+  .erow .ev b{color:var(--data);font-family:var(--mono);font-size:12px}
+  .erow .st{font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--struck);border:1px solid rgba(240,97,122,.35);border-radius:5px;padding:3px 8px;white-space:nowrap;margin-top:4px}
+  .erow.resolve{background:linear-gradient(180deg,rgba(255,180,84,.07),transparent)}
+  .erow.resolve .led{background:var(--signal);box-shadow:0 0 9px rgba(255,180,84,.6)}
+  .erow.resolve .ttl{color:var(--signal)}
+  .erow.resolve .st{color:var(--signal);border-color:rgba(255,180,84,.4)}
+
+  /* ---------- auctions ---------- */
+  .auc{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:6px 0 10px}
+  .acard{border:1px solid var(--line);border-radius:12px;background:var(--card);padding:18px 19px}
+  .acard h4{font-family:var(--sans);font-size:15px;margin:0 0 4px;color:var(--text)}
+  .acard .who{font-family:var(--mono);font-size:11px;color:var(--faint);margin-bottom:14px}
+  .formula{font-family:var(--mono);font-size:15px;color:var(--data);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;text-align:center;margin-bottom:13px}
+  .formula b{color:var(--signal)}
+  .acard p{font-size:13px;color:#c4cde0;margin:0;line-height:1.55}
+
+  /* ---------- stat strip ---------- */
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:6px 0 14px}
+  .stat{border:1px solid var(--line);border-radius:12px;background:var(--card);padding:16px}
+  .stat .v{font-family:var(--mono);font-size:26px;color:var(--signal);font-weight:600;line-height:1}
+  .stat .v.cy{color:var(--data)}
+  .stat .k{font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.4}
+  .note{font-size:13px;color:var(--faint);font-style:italic;margin:2px 0 0}
+
+  /* callout */
+  .call{border:1px solid var(--line);border-left:3px solid var(--signal);border-radius:10px;background:var(--panel);padding:16px 18px;margin:18px 0;font-size:14.5px;color:#cfd8ea}
+  .call b{color:#fff}
+  .call .q{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--signal);display:block;margin-bottom:8px}
+
+  /* table */
+  .tbl{width:100%;border-collapse:collapse;font-size:13.5px;margin:6px 0 8px}
+  .tbl th,.tbl td{text-align:left;padding:11px 13px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  .tbl th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-weight:500}
+  .tbl td .cn{font-family:var(--mono);color:var(--data);font-size:13px}
+  .tbl tr:last-child td{border-bottom:0}
+
+  footer{margin-top:64px;padding-top:22px;border-top:1px solid var(--line-soft);font-family:var(--mono);font-size:11.5px;color:var(--faint);line-height:1.8}
+  footer a{color:var(--data);text-decoration:none}
+
+  /* reveal */
+  .reveal{opacity:0;transform:translateY(14px);transition:opacity .6s ease,transform .6s ease}
+  .reveal.in{opacity:1;transform:none}
+  @media (prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}}
+
+  /* mobile */
+  .menu-btn{display:none}
+  @media (max-width:920px){
+    .rail{display:none}
+    .main{padding:0 22px 100px}
+    .grid,.auc{grid-template-columns:1fr}
+    .stats{grid-template-columns:1fr 1fr}
+    .hero{padding:56px 0 24px}
+    .erow{grid-template-columns:18px 1fr;gap:11px}
+    .erow .st{grid-column:2;justify-self:start}
+  }
+  :focus-visible{outline:2px solid var(--data);outline-offset:3px;border-radius:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <aside class="rail">
+    <div class="brand">
+      <b>smart-transaction-stack</b>
+      <span class="sub">Rust / Solana mainnet / Jito bundle infrastructure</span>
+    </div>
+    <span class="env"><span class="dot"></span>Mainnet</span>
+    <nav aria-label="Contents">
+      <ol>
+        <li><a href="#overview"><span class="n">00</span>What it does</a></li>
+        <li><a href="#system"><span class="n">01</span>System overview</a></li>
+        <li><a href="#crates"><span class="n">02</span>The crates</a></li>
+        <li><a href="#lifecycle"><span class="n">03</span>Submission lifecycle</a></li>
+        <li><a href="#latency"><span class="n">04</span>Latency investigation</a></li>
+        <li><a href="#auctions"><span class="n">05</span>The two auctions</a></li>
+        <li><a href="#failure"><span class="n">06</span>Failure &amp; the agent</a></li>
+        <li><a href="#findings"><span class="n">07</span>Findings</a></li>
+        <li><a href="#principles"><span class="n">08</span>Design principles</a></li>
+        <li><a href="#appendix"><span class="n">09</span>Workspace</a></li>
+      </ol>
+    </nav>
+    <div class="rail-foot">
+      v1.0 · architecture<br>
+      <a href="https://github.com/shrooms08/solana-smart-tx">github.com/shrooms08/solana-smart-tx</a>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="col">
+
+      <header class="hero">
+        <p class="eyebrow">System Architecture Document</p>
+        <h1>Smart Transaction Stack<br><span class="thin">getting a bundle into a block, on time, and knowing for certain whether it landed.</span></h1>
+        <p class="lede">A Rust service that submits Solana transactions through Jito bundles with the discipline a production system needs. It watches the leader schedule over a streaming connection, prices its tip from live auction data, tracks every submission through its full commitment lifecycle, classifies failures from real evidence, and lets an AI agent own one operational decision: <b>what to do when a bundle does not land.</b></p>
+        <div class="meta-row">
+          <span class="tag"><b>8</b> library crates + binary</span>
+          <span class="tag">Yellowstone gRPC</span>
+          <span class="tag">Jito Block Engine + BAM</span>
+          <span class="tag">SQLite lifecycle</span>
+          <span class="tag">AI failure reasoning</span>
+        </div>
+        <div class="readout">
+          <p class="lab">Central finding</p>
+          <p>Driven to where every operator-controlled variable is provably correct, a contentless bundle (memo plus self-transfer) still does not win a Jito auction. Confirmed with Jito support: a returned bundle id means <b>received, not selected</b>. The auction rewards economic value, not a bundle's mere existence.</p>
+        </div>
+      </header>
+
+      <section id="overview">
+        <div class="sec-head"><span class="sec-n">00</span><h2>What the system does</h2></div>
+        <div class="rule"></div>
+        <p>The job is narrow and unforgiving. On Solana, a transaction that is correct but late misses its slot. A bundle that is well-formed but under-tipped loses its auction. A confirmation read from a single RPC poll can lie by omission. The system is designed around these failure modes rather than the happy path, because the happy path is the part that takes care of itself.</p>
+        <p>On every run it:</p>
+        <ol class="steps">
+          <li>Streams slot updates and transaction statuses from a Yellowstone gRPC endpoint, so it always knows the current slot and can see its own transactions land.</li>
+          <li>Computes which upcoming slots belong to Jito-enabled leaders, and fires a submission window one to two slots <b>ahead</b> of such a leader, so the bundle is buffered at the block engine before that leader begins producing.</li>
+          <li>Prices the tip from the live Jito tip-floor stream rather than a hardcoded constant.</li>
+          <li>Builds a bundle and submits it through an authenticated, rate-limited path to the block engine.</li>
+          <li>Tracks the submission through Submitted, Processed, Confirmed, Finalized, stamping the slot and timestamp at each transition.</li>
+          <li>When a bundle does not reach a terminal state, classifies <b>why</b> from the evidence available, and hands that classification to an AI agent that decides whether to retry, reprice, refresh the blockhash, or give up.</li>
+        </ol>
+      </section>
+
+      <section id="system">
+        <div class="sec-head"><span class="sec-n">01</span><h2>System overview</h2></div>
+        <div class="rule"></div>
+        <div class="diagram" aria-label="System architecture diagram">
+          <p class="tier-lab">External services</p>
+          <div class="tier">
+            <div class="node ext"><div class="nm">Yellowstone gRPC</div></div>
+            <div class="node ext"><div class="nm">Jito validator API</div></div>
+            <div class="node ext"><div class="nm">Solana RPC</div></div>
+            <div class="node ext"><div class="nm">Jito tip-floor</div></div>
+            <div class="node ext"><div class="nm">Jito Block Engine</div></div>
+            <div class="node ext"><div class="nm">Anthropic API</div></div>
+          </div>
+          <div class="arrow">↓</div>
+          <p class="tier-lab">Ingestion</p>
+          <div class="tier">
+            <div class="node"><div class="nm">stream</div><div class="rl">slots + tx status</div></div>
+            <div class="node"><div class="nm">leader</div><div class="rl">schedule ∩ Jito set</div></div>
+            <div class="node"><div class="nm">tips</div><div class="rl">live percentiles</div></div>
+          </div>
+          <div class="arrow">↓</div>
+          <p class="tier-lab">Control + submission</p>
+          <div class="tier">
+            <div class="node core"><div class="nm">orchestrator</div><div class="rl">control loop</div></div>
+            <div class="node send"><div class="nm">submitter</div><div class="rl">build + send bundle</div></div>
+          </div>
+          <div class="arrow">↓</div>
+          <p class="tier-lab">Tracking + reasoning</p>
+          <div class="tier">
+            <div class="node"><div class="nm">lifecycle</div><div class="rl">commitment state machine</div></div>
+            <div class="node"><div class="nm">failure</div><div class="rl">evidence classifier</div></div>
+            <div class="node"><div class="nm">agent</div><div class="rl">retry / reprice / abort</div></div>
+          </div>
+        </div>
+        <p class="dgm-note">The arrows are data, not control. The orchestrator owns the control loop; every other crate is a focused capability it composes. The two crates that touch the network most aggressively, <b>stream</b> and <b>submitter</b>, carry the most defensive engineering, because that is where reality intrudes.</p>
+      </section>
+
+      <section id="crates">
+        <div class="sec-head"><span class="sec-n">02</span><h2>The crates</h2></div>
+        <div class="rule"></div>
+        <p>Eight library crates plus a binary. Each has one responsibility and a small surface area, so a problem can be localised to a single crate and tested there. For each, the responsibility and the one design decision worth knowing.</p>
+        <div class="grid">
+
+          <div class="crate">
+            <div class="cn">stream</div>
+            <p class="cr">Yellowstone gRPC ingestion: slot updates (the clock) and transaction statuses, under a reconnect supervisor that reconciles across gaps.</p>
+            <p class="dd"><b>Asymmetric backpressure</b>A dropped slot is harmless; the next arrives in ~400ms. A dropped tx status can mean missing a confirmation. Slots use a droppable try_send (freshness wins); statuses use an awaiting send that applies backpressure (delivery guaranteed). One stream, two delivery contracts.</p>
+          </div>
+
+          <div class="crate">
+            <div class="cn">leader</div>
+            <p class="cr">Intersects the RPC leader schedule with the Jito validator set, matching on the validator's identity account, and reports when the next Jito-led slot is near.</p>
+            <p class="dd"><b>Submit ahead, by leader group</b>Leaders run in groups of four slots. Since Jito holds most stake, the current slot is almost always already Jito-led, tempting a late submission. Instead the crate targets the start of the next group strictly ahead (current minus current mod 4, plus 4) and fires only one to two slots out.</p>
+          </div>
+
+          <div class="crate">
+            <div class="cn">tips</div>
+            <p class="cr">Converts Jito's live tip-floor websocket stream (REST fallback) into lamports, reporting p50, p75, p95.</p>
+            <p class="dd"><b>A feed, not a policy</b>It reports what the market is doing and leaves the choice of percentile to the orchestrator. No tip is ever hardcoded; every tip is derived from live data, and the percentile is configurable.</p>
+          </div>
+
+          <div class="crate">
+            <div class="cn">submitter</div>
+            <p class="cr">Builds the two-transaction bundle (memo plus self-transfer, then the tip transfer last) and submits it to the block engine.</p>
+            <p class="dd"><b>One network call in the hot path</b>The blockhash cache refreshes every two seconds and tip accounts are pre-warmed, so at submit time the only network call is sendBundle itself. Every block-engine call routes through a single rate-limited choke point that attaches the x-jito-auth header, with sendBundle prioritised over background traffic.</p>
+          </div>
+
+          <div class="crate">
+            <div class="cn">lifecycle</div>
+            <p class="cr">Persists submissions to SQLite and advances them through Submitted, Processed, Confirmed, Finalized, stamping slot and timestamp at each transition.</p>
+            <p class="dd"><b>Stream-driven, not RPC-polled</b>A single RPC poll sees only the moment it is asked; a bundle can land between polls. The tx-status stream delivers every transition as it happens. RPC polling is used only to reconcile after a gap. A timeout sweeper moves never-landed bundles to a terminal state.</p>
+          </div>
+
+          <div class="crate">
+            <div class="cn">failure</div>
+            <p class="cr">A pure classifier: given the evidence about a failed submission, returns a failure kind with a confidence level and rationale. No state, no network, exhaustively testable.</p>
+            <p class="dd"><b>Weigh competing causes</b>A never-landed bundle whose blockhash has since aged looks like an expiry, but if it lost its auction the expiry is a downstream symptom. Transport errors (including the rate-limit response) are checked first; ambiguity is named, not hidden behind false confidence.</p>
+          </div>
+
+          <div class="crate">
+            <div class="cn">agent</div>
+            <p class="cr">Owns one real operational decision: given a classified failure, retry as-is, raise the tip, refresh the blockhash and retry, or abort.</p>
+            <p class="dd"><b>Shadow baseline + guardrail</b>Every decision runs alongside a deterministic baseline in an A/B shadow, and both are persisted. Proposed actions pass through a clamp that bounds them. If the model call fails, the system falls back to the baseline rather than stalling.</p>
+          </div>
+
+          <div class="crate">
+            <div class="cn">orchestrator</div>
+            <p class="cr">The binary. Composes the crates into a run loop: warm up, wait for a window, price, submit, track, and on failure invoke the agent and act.</p>
+            <p class="dd"><b>Drain to terminal</b>It drains every submission to a terminal state before exiting, so a run produces a complete, honest record rather than leaving bundles in flight. Modes cover normal runs, fault injection, log export, and status inspection.</p>
+          </div>
+
+          <div class="crate">
+            <div class="cn">runtime</div>
+            <p class="cr">A small leaf crate shared by the others: one-time crypto-provider init, and credential redaction helpers for URLs and secrets.</p>
+            <p class="dd"><b>Redaction by default</b>URLs and tokens pass through masking helpers before they reach a log line, so endpoints and keys never leak into output.</p>
+          </div>
+
+        </div>
+      </section>
+
+      <section id="lifecycle">
+        <div class="sec-head"><span class="sec-n">03</span><h2>Submission lifecycle</h2></div>
+        <div class="rule"></div>
+        <p>One normal submission, end to end:</p>
+        <ol class="steps">
+          <li><b>Warmup.</b> stream connects and delivers slots; leader fetches the schedule and Jito set; tips connects; the blockhash and tip-account caches fill. The orchestrator waits until all three signals are live.</li>
+          <li><b>Window.</b> leader reports that a Jito leader's slot group begins one to two slots ahead, and whether that leader is BAM.</li>
+          <li><b>Price.</b> The orchestrator reads the configured percentile and sets the tip. On a BAM leader with BAM pricing enabled, it also sets a priority fee and a compute-unit limit.</li>
+          <li><b>Build and send.</b> submitter reads the cached blockhash and a tip account from memory, builds and signs the bundle, and sends it through the single authenticated, rate-limited choke point.</li>
+          <li><b>Track.</b> The returned bundle id and memo signature are recorded; lifecycle begins watching the tx-status stream for the memo signature.</li>
+          <li><b>Resolve.</b> Either the memo signature appears and lifecycle advances the bundle through its commitment states, or the timeout sweeper moves it to a terminal never-landed state.</li>
+          <li><b>On failure.</b> failure classifies the cause from evidence; agent decides the response; the orchestrator acts, bounded by a maximum attempt count.</li>
+        </ol>
+        <p class="note">Commitment transitions are instrumented end to end. In the recorded runs no bundle reached Processed, so no live commitment-latency deltas exist to report; the values discussed below are derived from Solana's slot timing and labelled as such.</p>
+      </section>
+
+      <section id="latency">
+        <div class="sec-head"><span class="sec-n">04</span><h2>The latency investigation</h2></div>
+        <div class="rule"></div>
+        <p>The most instructive part of building this system was discovering why, for a long time, no bundle would land. The method throughout: when a bundle did not land, do not theorise, <strong>measure something that distinguishes the candidate causes.</strong> Capture the raw response. Decode the bytes on the wire. Simulate the exact signed transaction. Query the source of truth directly. Reasoning from absence repeatedly misled; reasoning from a captured measurement repeatedly resolved.</p>
+
+        <h3>The hot path, before and after</h3>
+        <p>Timing telemetry showed the in-window work was dominated by RPC round-trips and, hidden inside the send, a full TLS handshake re-established on every call. Pre-fetching the blockhash and tip accounts and pooling one warm connection collapsed it:</p>
+        <div class="lat">
+          <div class="lat-row">
+            <div class="lat-top"><span class="lat-name">Before · in-window work</span><span class="lat-val">&gt; <b>1,500 ms</b> · 3 to 4 slots late</span></div>
+            <div class="bar">
+              <div class="seg rpc" style="width:33%">blockhash RPC ~870ms</div>
+              <div class="seg rpc" style="width:30%" >tip RPC</div>
+              <div class="seg tls lbl-light" style="width:37%">send + TLS</div>
+            </div>
+          </div>
+          <div class="lat-row">
+            <div class="lat-top"><span class="lat-name">After · caches warm, connection pooled</span><span class="lat-val"><b>229 ms</b> · slots drifted 0</span></div>
+            <div class="bar" style="width:14%;min-width:160px">
+              <div class="seg prep lbl-light" style="width:18%">3</div>
+              <div class="seg send lbl-light" style="width:82%">send 224ms</div>
+            </div>
+          </div>
+          <div class="lat-foot">
+            <span><i class="chip" style="background:#6b7794"></i>RPC round-trip ~870ms each</span>
+            <span><i class="chip" style="background:var(--struck)"></i>TLS handshake ~2,948ms / call, re-established</span>
+            <span><i class="chip" style="background:var(--data)"></i>prepare 3ms</span>
+            <span><i class="chip" style="background:var(--ok)"></i>send 224ms (~196ms regional floor)</span>
+          </div>
+        </div>
+        <p>The TLS figure is the one that mattered most: a connect-versus-transfer probe showed roughly <span class="m">2,948 ms</span> of every send was a fresh handshake, against a ~196ms physical floor to the region. Pooling and pre-warming the connection removed it from the hot path entirely.</p>
+
+        <h3>Nine hypotheses, each killed by a measurement</h3>
+        <div class="elim">
+          <div class="elim-h"><span>Diagnostic log · why a bundle does not land</span><span class="grn">9 ruled out</span></div>
+          <div class="erow">
+            <span class="led"></span>
+            <div><div class="ttl">01 · Bundle construction</div><div class="ev">Decoded the exact bytes on the wire: correct tip transfer, valid tip account, shared blockhash, tip last. <b>Structurally perfect.</b></div></div>
+            <span class="st">on-wire decode</span>
+          </div>
+          <div class="erow">
+            <span class="led"></span>
+            <div><div class="ttl">02 · Execution / simulation</div><div class="ev">simulateTransaction with sigVerify on and blockhash replacement off. <b>Both transactions executed cleanly.</b></div></div>
+            <span class="st">simulation</span>
+          </div>
+          <div class="erow">
+            <span class="led"></span>
+            <div><div class="ttl">03 · Wallet funding</div><div class="ev">Checked the on-chain balance directly. <b>Funded.</b></div></div>
+            <span class="st">on-chain</span>
+          </div>
+          <div class="erow">
+            <span class="led"></span>
+            <div><div class="ttl">04 · Tip competitiveness</div><div class="ev">Tried tips from p75 up to roughly six times the live p95, to a verified tip account. <b>Still no land.</b></div></div>
+            <span class="st">measured</span>
+          </div>
+          <div class="erow">
+            <span class="led"></span>
+            <div><div class="ttl">05 · Submission timing</div><div class="ev">Found ~870ms per RPC round-trip; the bundle arrived 3 to 4 slots after the target slot. <b>Fixed: submit ahead + caches.</b></div></div>
+            <span class="st">telemetry</span>
+          </div>
+          <div class="erow">
+            <span class="led"></span>
+            <div><div class="ttl">06 · TLS handshake</div><div class="ev">~2,948ms of each send was a fresh handshake. <b>Fixed: pooled, pre-warmed connection, send to ~200ms.</b></div></div>
+            <span class="st">connect probe</span>
+          </div>
+          <div class="erow">
+            <span class="led"></span>
+            <div><div class="ttl">07 · Rate limiting</div><div class="ev">Raw response showed HTTP 429, code -32097, "globally rate limited." Own background traffic collided on the anonymous budget. <b>Fixed: shared limiter, send priority.</b></div></div>
+            <span class="st">raw 429</span>
+          </div>
+          <div class="erow">
+            <span class="led"></span>
+            <div><div class="ttl">08 · Region routing</div><div class="ev">Global block engine versus Amsterdam: identical result on both. <b>Ruled out.</b></div></div>
+            <span class="st">A/B endpoint</span>
+          </div>
+          <div class="erow">
+            <span class="led"></span>
+            <div><div class="ttl">09 · Authentication + BAM fees</div><div class="ev">Authenticated with a JSON-RPC UUID, priority fee on BAM leaders with a pinned compute-unit limit. <b>Still Invalid.</b></div></div>
+            <span class="st">authenticated</span>
+          </div>
+          <div class="erow resolve">
+            <span class="led"></span>
+            <div><div class="ttl">→ Resolution · Jito support</div><div class="ev">A returned bundle id means the bundle was received, not that it won. Invalid from the status API means it did not win its auction and the record was discarded. Anonymous bundles rarely win; the auctions reward economic value, not existence.</div></div>
+            <span class="st">source of truth</span>
+          </div>
+        </div>
+        <p>The value of this investigation is not that it ended in a single fix. It is that the system is now instrumented to tell the truth about its own behaviour, so the next surprise is a measurement away, not a guess away.</p>
+      </section>
+
+      <section id="auctions">
+        <div class="sec-head"><span class="sec-n">05</span><h2>The two auctions</h2></div>
+        <div class="rule"></div>
+        <p>A Jito-enabled validator may run one or two auctions, and they score bundles differently. The system surfaces an <span class="m">is_bam</span> bit per leader so it can price for whichever auction the target runs.</p>
+        <div class="auc">
+          <div class="acard">
+            <h4>Block Engine auction</h4>
+            <p class="who">every Jito validator</p>
+            <div class="formula">priority ≈ <b>tips</b> / CU</div>
+            <p>Only the tip matters, and a tight compute footprint helps. A contentless bundle competes on an axis where it has no structural advantage against real MEV flow.</p>
+          </div>
+          <div class="acard">
+            <h4>BAM Node auction</h4>
+            <p class="who">BAM validators only (387 of 688 in one observed run)</p>
+            <div class="formula">priority ≈ (<b>tips</b> + <b>priority fees</b>) / CU</div>
+            <p>Priority fees count too, so a tip-only bundle competes with half the formula missing. The submitter can attach a priority fee paired with an explicit compute-unit limit.</p>
+          </div>
+        </div>
+        <div class="call">
+          <span class="q">Why the compute-unit limit is paired</span>
+          The fee is <b>price × requested-CU-limit</b>. Without an explicit limit the default request inflates the denominator several-fold, both making the fee unpredictable and collapsing the (tips + fees) / CU ratio the auction actually scores. Pinning the limit keeps the denominator tight and the fee deliberate.
+        </div>
+      </section>
+
+      <section id="failure">
+        <div class="sec-head"><span class="sec-n">06</span><h2>Failure classification &amp; the AI decision</h2></div>
+        <div class="rule"></div>
+        <p>The system is built around failure, not the happy path. It produces and classifies real failures, then lets the agent decide the response.</p>
+        <ul class="clean">
+          <li><strong>TransportError</strong> — network and rate-limit failures, including the block engine's HTTP 429, checked first so they are never misread as a pricing or construction fault.</li>
+          <li><strong>FeeTooLow</strong> — the tip was below what the auction required.</li>
+          <li><strong>ExpiredBlockhash</strong> — the referenced blockhash was genuinely stale at submission, not merely aged while waiting.</li>
+          <li><strong>AuctionLost</strong> — the block engine accepted the bundle (a bundle id was returned) but the status API reported Invalid: it did not win its auction. The aged blockhash on such a bundle is named a downstream symptom, not the cause.</li>
+        </ul>
+        <h3>The corrected classification matters</h3>
+        <p>An earlier version labelled every never-landed bundle <span class="m">ExpiredBlockhash</span>, because the blockhash had aged past 150 slots by the time the sweeper ran. But that age accrued <em>while the bundle sat unlanded after losing its auction</em>. The fix introduced <span class="m">AuctionLost</span>, plumbed the persisted Jito verdict into the evidence the classifier sees, and reserved ExpiredBlockhash for blockhashes stale at submission. The result reads honestly: the failures are auction losses, which is both the true story and the more sophisticated one.</p>
+
+        <h3>What one judged run produced</h3>
+        <div class="stats">
+          <div class="stat"><div class="v">58</div><div class="k">real bundles recorded (49 failed, 9 in-flight)</div></div>
+          <div class="stat"><div class="v">49</div><div class="k">classified AuctionLost (zero false ExpiredBlockhash)</div></div>
+          <div class="stat"><div class="v cy">95</div><div class="k">agent decisions: 47 LLM + 47 baseline shadow + 1 fallback</div></div>
+          <div class="stat"><div class="v cy">10/39</div><div class="k">Certain vs Ambiguous classifications</div></div>
+        </div>
+        <p>Across those decisions the agent visibly tracked a live market: raising the tip into rising auctions, declining to overpay into cooling ones, and separating a competitive-tip-but-stale-blockhash from a genuine needs-higher-bid. The <strong>Certain</strong> versus <strong>Ambiguous</strong> split reflects whether the poller captured a definitive Invalid before the sweep. And at one point the LLM call failed and the deterministic baseline took over with a refresh-and-resubmit: the resilience path, demonstrated in the log rather than merely claimed.</p>
+        <p class="note">Honest scope: leader identity and the is_bam flag are not persisted per row, so they are omitted per bundle rather than inferred. No bundle reached Processed, Confirmed, or Finalized, so there are no commitment-latency deltas to report.</p>
+      </section>
+
+      <section id="findings">
+        <div class="sec-head"><span class="sec-n">07</span><h2>Findings</h2></div>
+        <div class="rule"></div>
+        <p>The central finding came from driving the system to the point where every variable under the operator's control is provably correct, and then asking what remained.</p>
+        <p>With construction, execution, funding, tip, timing, authentication, region, and BAM priority fees all eliminated by measurement, the block engine consistently accepts the bundle and then reports it Invalid: it did not win its auction. The conclusion the evidence supports is that <strong>a bundle carrying no economic activity does not win a Jito auction against the real arbitrage and swap flow it competes with</strong>, and that no amount of tip, priority fee, authentication, timing precision, or region selection changes that, because the auction rewards the value a bundle brings to the block, not the bundle's presence.</p>
+        <div class="call">
+          <span class="q">What landing would require</span>
+          Give the bundle genuine economic content: a real on-chain action whose profit funds the tip. At that point it competes on the same axis as the flow that currently beats it. The infrastructure built here, streaming, leader targeting, live tip pricing, low-latency authenticated submission, lifecycle tracking, classification, and the agent layer, is exactly what such a strategy sits on top of. The hard part of a smart transaction stack is the machinery, and the machinery is what this project built and verified.
+        </div>
+      </section>
+
+      <section id="principles">
+        <div class="sec-head"><span class="sec-n">08</span><h2>Design principles</h2></div>
+        <div class="rule"></div>
+        <ul class="clean">
+          <li><strong>Match the delivery contract to the value of the data.</strong> Lossy where freshness wins (slots), guaranteed where completeness wins (tx status).</li>
+          <li><strong>Keep the hot path free of network calls.</strong> Everything a submission needs is pre-fetched; the only in-window call is the send.</li>
+          <li><strong>Submit ahead of the leader, not at it.</strong> Buffer the bundle before the slot begins.</li>
+          <li><strong>One choke point for the block engine.</strong> Authentication and rate limiting live in a single function, live submissions prioritised over background traffic.</li>
+          <li><strong>Classify from evidence, and admit ambiguity.</strong> Weigh competing causes; do not return false confidence.</li>
+          <li><strong>Let the model reason, but bound it.</strong> A shadow baseline, a guardrail clamp, and a deterministic fallback keep the AI decision safe and auditable.</li>
+          <li><strong>Measure, do not guess.</strong> Every hard problem in this build was solved by capturing a measurement that distinguished the candidate causes.</li>
+        </ul>
+      </section>
+
+      <section id="appendix">
+        <div class="sec-head"><span class="sec-n">09</span><h2>Workspace</h2></div>
+        <div class="rule"></div>
+        <table class="tbl">
+          <thead><tr><th>Crate</th><th>Responsibility</th></tr></thead>
+          <tbody>
+            <tr><td><span class="cn">stream</span></td><td>Yellowstone gRPC ingestion (slots + tx status), reconnect supervisor, asymmetric backpressure</td></tr>
+            <tr><td><span class="cn">leader</span></td><td>Leader schedule intersected with the Jito validator set; submit-ahead window logic; BAM detection</td></tr>
+            <tr><td><span class="cn">tips</span></td><td>Live tip-floor percentiles from Jito's websocket, REST fallback</td></tr>
+            <tr><td><span class="cn">submitter</span></td><td>Bundle construction, signing, submission; hot-path caches; the single authenticated, rate-limited choke point</td></tr>
+            <tr><td><span class="cn">lifecycle</span></td><td>SQLite commitment state machine; stream-driven confirmation; timeout sweeper</td></tr>
+            <tr><td><span class="cn">failure</span></td><td>Pure evidence-based failure classifier</td></tr>
+            <tr><td><span class="cn">agent</span></td><td>The AI operational decision, with a shadow baseline and guardrails</td></tr>
+            <tr><td><span class="cn">orchestrator</span></td><td>The control-loop binary that composes all of the above</td></tr>
+            <tr><td><span class="cn">runtime</span></td><td>Shared crypto init and credential-redaction helpers</td></tr>
+          </tbody>
+        </table>
+        <footer>
+          Smart Transaction Stack · System Architecture v1.0<br>
+          Source and lifecycle log: <a href="https://github.com/shrooms08/solana-smart-tx">github.com/shrooms08/solana-smart-tx</a>
+        </footer>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<script>
+  // scrollspy
+  (function(){
+    var links = Array.prototype.slice.call(document.querySelectorAll('nav a'));
+    var map = {};
+    links.forEach(function(l){ map[l.getAttribute('href').slice(1)] = l; });
+    var secs = Array.prototype.slice.call(document.querySelectorAll('section'));
+    var spy = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if(e.isIntersecting){
+          links.forEach(function(l){l.classList.remove('active');});
+          var a = map[e.target.id];
+          if(a) a.classList.add('active');
+        }
+      });
+    }, {rootMargin:'-15% 0px -70% 0px', threshold:0});
+    secs.forEach(function(s){ spy.observe(s); });
+
+    // reveal on scroll
+    var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if(!reduce){
+      var revs = Array.prototype.slice.call(document.querySelectorAll('section, .readout'));
+      revs.forEach(function(el){ el.classList.add('reveal'); });
+      var io = new IntersectionObserver(function(entries){
+        entries.forEach(function(e){
+          if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); }
+        });
+      }, {rootMargin:'0px 0px -8% 0px', threshold:0.04});
+      revs.forEach(function(el){ io.observe(el); });
+    }
+  })();
+</script>
+</body>
+</html>
