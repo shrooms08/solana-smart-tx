@@ -1,5 +1,7 @@
 # Smart Transaction Stack
 
+[![CI](https://github.com/shrooms08/solana-smart-tx/actions/workflows/ci.yml/badge.svg)](https://github.com/shrooms08/solana-smart-tx/actions/workflows/ci.yml)
+
 A Rust service that submits Solana transactions through Jito bundles with the
 discipline a production system needs: it watches the leader schedule over a
 streaming connection, prices its tip from live auction data, tracks every
@@ -66,31 +68,40 @@ Eight library crates plus a binary:
 
 ### Configuration
 
-Copy `.env.example` to `.env` and fill in the values:
+Copy `.env.example` to `.env` and fill in the values. `.env.example` is the
+authoritative list of every variable the orchestrator reads (with inline notes);
+the keys and defaults below mirror it exactly:
+
+```bash
+cp .env.example .env
+```
 
 ```
 # Streaming + RPC
-YELLOWSTONE_ENDPOINT=https://<your-grpc-endpoint>:443
-YELLOWSTONE_X_TOKEN=<token>
-RPC_URL=https://<your-rpc-endpoint>
+YELLOWSTONE_ENDPOINT=https://your-grpc-endpoint:10000
+YELLOWSTONE_X_TOKEN=                    # optional, provider-dependent
+RPC_URL=https://api.mainnet-beta.solana.com
 
-# Wallet
-WALLET_PATH=./keys/smart-tx-wallet.json
+# Wallet keypair JSON (kept out of git)
+WALLET_KEYPAIR_PATH=./wallet-keypair.json
 
-# Jito block engine
-JITO_BLOCK_ENGINE_URL=https://mainnet.block-engine.jito.wtf
-JITO_AUTH_UUID=<your-jito-uuid>        # authenticated submission
-JITO_RPS=2                             # rate limit your UUID permits
+# Jito block engine (regional base URL nearest your infra; Amsterdam shown)
+JITO_BLOCK_ENGINE_URL=https://amsterdam.mainnet.block-engine.jito.wtf
+JITO_AUTH_UUID=                         # optional; x-jito-auth header, raises 1 -> 5 RPS
+JITO_RPS=1                              # 1 anonymous; set 5 with a UUID
 
 # Tip policy
-TIP_PERCENTILE=p75                     # p50 | p75 | p95
+TIP_PERCENTILE=p75                      # p50 | p75 | p95
 MAX_TIP_LAMPORTS=100000
 
+# Bundle payload
+SELF_TRANSFER_LAMPORTS=1000             # wallet->wallet self-transfer in the payload tx
+
 # Agent
-ANTHROPIC_API_KEY=<key>
+ANTHROPIC_API_KEY=
 
 # BAM pricing (optional, off by default)
-BAM_PRIORITY_FEE_ENABLED=false
+BAM_PRIORITY_FEE_ENABLED=0
 BAM_PRIORITY_FEE_MICROLAMPORTS=0
 BAM_PRIORITY_FEE_CU_LIMIT=10000
 ```
