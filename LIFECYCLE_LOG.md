@@ -1,5 +1,12 @@
 # Smart-Tx — Bundle Lifecycle Log (real mainnet submissions, AuctionLost classifier)
 
+> **This is the memo-path log: the contentless-bundle auction characterization (58 bundles).**
+> Its companion, [LIFECYCLE_LOG_SWAP.md](./LIFECYCLE_LOG_SWAP.md), is the real-Jupiter-content
+> auction test (38 bundles) — bundles carrying a genuine SOL→USDC swap, which still lose the
+> auction. Together they tell the full story: a contentless bundle does not win (here), and giving
+> it real economic content is necessary but **not sufficient** — winning needs the content's own
+> profit to fund a competitive tip (see the swap log's findings).
+
 _Generated from `smart_tx.db` — the latest run, recorded AFTER the AuctionLost classifier fix with `jito_inflight_status` now persisted by the bundle-status poller. 58 distinct bundles (49 Failed, 9 Submitted/in-flight), 95 agent decisions. Every value is copied verbatim from the recorded `bundle_submissions` and `agent_decisions` tables — nothing is synthetic or altered._
 
 ## How to read this
