@@ -51,6 +51,36 @@ const TIP_REFRESH: Duration = Duration::from_secs(120);
 const BUNDLE_STATUS_POLL: Duration = Duration::from_secs(5);
 const BUNDLE_STATUS_BUDGET: Duration = Duration::from_secs(30);
 
+/// Swap-mode pre-fetch tuning. In `PAYLOAD=swap` a background task keeps one
+/// freshly-fetched, signable Jupiter swap tx warm so the submission hot path makes
+/// NO Jupiter call (the ~700ms fetch happens AHEAD of the window, not in it). The
+/// swap tx is leader-agnostic (a generic SOL→USDC swap), so it is valid for
+/// whatever window opens next while its Jupiter blockhash is fresh (~150 slots).
+const SWAP_PREFETCH_POLL: Duration = Duration::from_millis(200);
+/// Refresh a warm swap once it is older than this (keeps it well within validity).
+const SWAP_PREFETCH_REFRESH_SLOTS: u64 = 15;
+/// The hot path uses a pre-fetched swap only if it is no older than this; past it,
+/// fall back to an in-window fetch. Far under Jupiter's ~150-slot blockhash window.
+const SWAP_PREFETCH_MAX_AGE_SLOTS: u64 = 50;
+/// Start pre-fetching when the next Jito leader is within `swap_lead_slots + this`,
+/// so the ~700ms (~1.7 slot) fetch completes before the window opens.
+const SWAP_PREFETCH_AHEAD_SLOTS: u64 = 3;
+
+/// A pre-fetched, signable Jupiter swap transaction kept warm for the next window.
+#[derive(Clone)]
+pub struct PreFetchedSwap {
+    /// The unsigned base64 Jupiter swap tx (the submitter signs it as tx0).
+    swap_tx_base64: String,
+    /// Orchestrator slot clock when this was fetched — used for the freshness age.
+    fetched_at_slot: u64,
+    /// Route + expected out amount, for logging.
+    route: String,
+    out_amount: String,
+}
+
+/// Shared slot for the warm pre-fetched swap (background writer, hot-path reader).
+pub type SwapPrefetchCache = Arc<std::sync::Mutex<Option<PreFetchedSwap>>>;
+
 /// Unique-ifies synthetic rejection rows (rejected bundles never produce a real
 /// signature / bundle id, but the lifecycle row needs unique keys).
 static REJECTION_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -175,6 +205,32 @@ impl Submit for BundleSubmitter<LiveGateway> {
 // ---------------------------------------------------------------------------
 
 /// Which landed-tip percentile the normal policy targets. Configured via the
+/// Bundle payload mode (`PAYLOAD` env, default `memo`). `Memo` keeps the existing
+/// memo + self-transfer payload; `Swap` uses a real Jupiter swap as tx0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadKind {
+    Memo,
+    Swap,
+}
+
+impl PayloadKind {
+    /// Parse from `"memo" | "swap"` (case-insensitive). `None` if invalid.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "memo" => Some(Self::Memo),
+            "swap" => Some(Self::Swap),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memo => "memo",
+            Self::Swap => "swap",
+        }
+    }
+}
+
 /// `TIP_PERCENTILE` env var (`p50` | `p75` | `p95`, default `p75`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TipPercentile {
@@ -340,9 +396,40 @@ pub fn base_spec(tip: u64, memo: String) -> BundleSpec {
         memo_text: memo,
         priority_fee_microlamports: 0,
         priority_fee_cu_limit: 0,
+        swap_tx_base64: None,
         #[cfg(feature = "fault-injection")]
         fault: None,
     }
+}
+
+/// Fetch a fresh Jupiter quote + (unsigned) swap transaction for `amount` base
+/// units of `input_mint` → `output_mint`. Returns the base64 swap tx, the route
+/// label, and the expected out amount. Shared by the in-window fallback and the
+/// background pre-fetcher. `wrapAndUnwrapSol = true` (one side is native SOL).
+async fn fetch_jupiter_swap(
+    jupiter: &submitter::jupiter::JupiterClient,
+    input_mint: &str,
+    output_mint: &str,
+    amount: u64,
+    slippage_bps: u16,
+    user_pubkey: &Pubkey,
+) -> anyhow::Result<(String, String, String)> {
+    let quote = jupiter
+        .fetch_quote(input_mint, output_mint, amount, slippage_bps)
+        .await?;
+    let route = {
+        let labels = quote.route_labels();
+        if labels.is_empty() {
+            "(direct)".to_string()
+        } else {
+            labels.join(" -> ")
+        }
+    };
+    let out_amount = quote.out_amount().unwrap_or_default();
+    let swap_b64 = jupiter
+        .fetch_swap_transaction(&quote, &user_pubkey.to_string(), true)
+        .await?;
+    Ok((swap_b64, route, out_amount))
 }
 
 /// The agent retry loop. Given the failed attempt's classification + evidence,
@@ -566,6 +653,12 @@ pub struct App {
     pub leader: LeaderTracker<RpcJitoSource>,
     pub tips: TipTracker,
     pub submitter: Arc<BundleSubmitter<LiveGateway>>,
+    /// Jupiter swap client — used in `PAYLOAD=swap` mode to fetch a fresh quote +
+    /// swap transaction (in the background pre-fetcher and the in-window fallback).
+    pub jupiter: submitter::jupiter::JupiterClient,
+    /// Warm pre-fetched swap tx for `PAYLOAD=swap` (written by the background
+    /// pre-fetcher, consumed by `submit_one`). Empty in memo mode.
+    pub swap_prefetch: SwapPrefetchCache,
     pub lifecycle: LifecycleTracker,
     pub agent_log: agent::AgentLog,
     pub llm: FailureReasoningAgent,
@@ -619,8 +712,17 @@ impl App {
             config.rpc_url.clone(),
         ));
 
+        // In swap mode, widen the window to fire `swap_lead_slots` ahead of the
+        // target leader (configurable runway); memo mode keeps the default.
+        let leader_config = {
+            let mut c = LeaderConfig::default();
+            if config.payload == PayloadKind::Swap {
+                c.threshold_slots = config.swap_lead_slots.max(1);
+            }
+            c
+        };
         let leader = LeaderTracker::new(
-            LeaderConfig::default(),
+            leader_config,
             RpcJitoSource::mainnet(config.rpc_url.clone()),
         );
         let tips = TipTracker::live(TipConfig::default());
@@ -632,6 +734,11 @@ impl App {
             request_timeout: config.agent_timeout,
         });
 
+        // Jupiter client for swap-payload mode (lite/free host; pooled like the
+        // block-engine client). Only used when PAYLOAD=swap.
+        let jupiter = submitter::jupiter::JupiterClient::new();
+        let swap_prefetch: SwapPrefetchCache = Arc::new(std::sync::Mutex::new(None));
+
         Ok(Self {
             config,
             wallet_pubkey,
@@ -639,6 +746,8 @@ impl App {
             leader,
             tips,
             submitter,
+            jupiter,
+            swap_prefetch,
             lifecycle,
             agent_log,
             llm,
@@ -721,6 +830,79 @@ impl App {
                         ),
                     }
                     tokio::time::sleep(TIP_REFRESH).await;
+                }
+            }));
+        }
+
+        // Swap-mode background pre-fetcher — keeps one warm, signable Jupiter swap
+        // tx ready AHEAD of the window so the submission hot path makes no Jupiter
+        // call (removing the ~700ms in-window fetch that caused slot drift).
+        if self.config.payload == PayloadKind::Swap {
+            let jupiter = self.jupiter.clone();
+            let leader = self.leader.clone();
+            let cache = Arc::clone(&self.swap_prefetch);
+            let wallet = self.wallet_pubkey;
+            let input_mint = self.config.swap_input_mint.clone();
+            let output_mint = self.config.swap_output_mint.clone();
+            let amount = self.config.swap_amount_lamports;
+            let slippage = self.config.swap_slippage_bps;
+            let lead = self.config.swap_lead_slots;
+            handles.push(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(SWAP_PREFETCH_POLL).await;
+                    // Peek at the upcoming Jito leader (non-blocking).
+                    let window = match leader.current_window().await {
+                        Ok(w) => w,
+                        Err(_) => continue, // not warmed up yet / no jito leader
+                    };
+                    // Only pre-fetch when a window is approaching.
+                    if window.slots_until > lead + SWAP_PREFETCH_AHEAD_SLOTS {
+                        continue;
+                    }
+                    // Skip if a sufficiently-fresh swap is already warm.
+                    let need_fetch = {
+                        let guard = cache.lock().unwrap();
+                        match guard.as_ref() {
+                            Some(pf) => {
+                                window.current_slot.saturating_sub(pf.fetched_at_slot)
+                                    > SWAP_PREFETCH_REFRESH_SLOTS
+                            }
+                            None => true,
+                        }
+                    };
+                    if !need_fetch {
+                        continue;
+                    }
+                    let fetch_slot = window.current_slot;
+                    match fetch_jupiter_swap(
+                        &jupiter,
+                        &input_mint,
+                        &output_mint,
+                        amount,
+                        slippage,
+                        &wallet,
+                    )
+                    .await
+                    {
+                        Ok((swap_tx_base64, route, out_amount)) => {
+                            *cache.lock().unwrap() = Some(PreFetchedSwap {
+                                swap_tx_base64,
+                                fetched_at_slot: fetch_slot,
+                                route: route.clone(),
+                                out_amount: out_amount.clone(),
+                            });
+                            debug!(
+                                route = %route,
+                                out_amount = %out_amount,
+                                fetched_at_slot = fetch_slot,
+                                "pre-fetched warm Jupiter swap for the upcoming window"
+                            );
+                        }
+                        Err(err) => warn!(
+                            error = %runtime::redact_url(&err.to_string()),
+                            "swap pre-fetch failed; hot path will fall back to in-window fetch"
+                        ),
+                    }
                 }
             }));
         }
@@ -892,6 +1074,21 @@ impl App {
         }
     }
 
+    /// Fetch a fresh Jupiter quote and swap transaction for the configured swap
+    /// (default 0.01 SOL → USDC) — the in-window fallback when no warm pre-fetch is
+    /// available. Returns the unsigned base64 swap tx + route + expected out amount.
+    async fn fetch_swap_payload(&self) -> anyhow::Result<(String, String, String)> {
+        fetch_jupiter_swap(
+            &self.jupiter,
+            &self.config.swap_input_mint,
+            &self.config.swap_output_mint,
+            self.config.swap_amount_lamports,
+            self.config.swap_slippage_bps,
+            &self.wallet_pubkey,
+        )
+        .await
+    }
+
     /// The one submission pipeline used by all modes.
     pub async fn submit_one(&self, mut spec: BundleSpec) -> anyhow::Result<()> {
         // 1. Wait for a Jito leader window.
@@ -974,6 +1171,54 @@ impl App {
         // the submitter; the agent's SetTip overrides it on retries.)
         spec.tip_lamports = policy.tip;
         let current_slot = window.current_slot;
+
+        // 2b. Swap-payload mode: use a WARM pre-fetched swap if one is ready and
+        // fresh (no Jupiter call in the hot path — this is the slot-drift fix). The
+        // swap tx is leader-agnostic and Jupiter's blockhash is valid ~150 slots, so
+        // a swap fetched 1-2 slots early is well within validity. If none is warm /
+        // it is stale, fall back to an in-window fetch.
+        if self.config.payload == PayloadKind::Swap {
+            // Consume whatever the pre-fetcher has staged.
+            let staged = self.swap_prefetch.lock().unwrap().take();
+            let fresh = staged.filter(|pf| {
+                current_slot.saturating_sub(pf.fetched_at_slot) <= SWAP_PREFETCH_MAX_AGE_SLOTS
+            });
+            match fresh {
+                Some(pf) => {
+                    let age = current_slot.saturating_sub(pf.fetched_at_slot);
+                    info!(
+                        route = %pf.route,
+                        out_amount = %pf.out_amount,
+                        swap_blockhash_age_slots = age,
+                        max_age_slots = SWAP_PREFETCH_MAX_AGE_SLOTS,
+                        "swap payload: using PRE-FETCHED swap (no in-window Jupiter call)"
+                    );
+                    spec.swap_tx_base64 = Some(pf.swap_tx_base64);
+                }
+                None => {
+                    // Fallback: fetch in-window (adds ~700ms; logged for comparison).
+                    let t_swap = std::time::Instant::now();
+                    match self.fetch_swap_payload().await {
+                        Ok((swap_b64, route, out_amount)) => {
+                            info!(
+                                route = %route,
+                                out_amount = %out_amount,
+                                swap_fetch_ms = t_swap.elapsed().as_millis(),
+                                "swap payload: no warm pre-fetch — fetched fresh Jupiter swap IN-WINDOW (fallback)"
+                            );
+                            spec.swap_tx_base64 = Some(swap_b64);
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %runtime::redact_url(&err.to_string()),
+                                "swap payload fetch failed; skipping this submission window"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
 
         // 3. Submit (timed end-to-end).
         let result = self.submitter.submit_bundle(spec.clone(), current_slot).await;

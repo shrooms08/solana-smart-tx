@@ -27,8 +27,13 @@ use solana_sdk::hash::Hash;
 use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use tracing::{debug, info, warn};
+
+/// Jupiter swap API client (route quote + signable swap transaction). The first
+/// step toward giving the bundle real economic content; not yet wired into the
+/// bundle path.
+pub mod jupiter;
 
 /// SPL Memo program id (current `solana-program/memo`). Verified by
 /// [`tests::memo_program_id_is_valid`].
@@ -114,6 +119,15 @@ pub struct BundleSpec {
     /// are predictable, instead of the unbounded `200k × num_instructions` default.
     /// `0` leaves the CU limit at the runtime default.
     pub priority_fee_cu_limit: u32,
+    /// Swap-payload mode ("Path 2"). When `Some`, this is a base64 Jupiter swap
+    /// `VersionedTransaction` (built by Jupiter with its OWN blockhash + address
+    /// lookup tables) to use as bundle tx0 — giving the bundle real economic
+    /// content. The submitter signs it as-is (never decomposes or re-anchors it)
+    /// and builds the tip tx1 on our cached blockhash; the two are independent and
+    /// do NOT share a blockhash. `None` (the default) keeps the memo+self-transfer
+    /// path. Because Jupiter's tx carries its own expiry, this must be fetched
+    /// fresh inside the submission window, not cached.
+    pub swap_tx_base64: Option<String>,
     /// Optional injected fault (compiled out without `fault-injection`).
     #[cfg(feature = "fault-injection")]
     pub fault: Option<Fault>,
@@ -132,11 +146,15 @@ pub struct BundleRecord {
     pub tip_lamports: u64,
     /// Base58 tip account that received the transfer.
     pub tip_account: String,
-    /// Base58 signature of the memo tx — what we track on-stream.
+    /// Base58 signature of tx0 — the tracking signature we watch on-stream for
+    /// the commitment lifecycle. In memo mode this is the memo tx's signature; in
+    /// swap mode it is the Jupiter swap tx's signature.
     pub memo_signature: String,
     /// Base58 signature of the tip tx.
     pub tip_signature: String,
-    /// Base58 blockhash both txs were anchored on.
+    /// Base58 blockhash the tip tx (tx1) was anchored on (our cached blockhash).
+    /// In swap mode, tx0 carries its own Jupiter-supplied blockhash — the two are
+    /// independent and do not share a blockhash.
     pub blockhash: String,
     /// Caller-supplied slot (stream clock) at the time the blockhash was fetched.
     pub blockhash_fetched_at_slot: u64,
@@ -305,6 +323,38 @@ pub struct BundleSimulation {
     pub tip_account: String,
     pub tip_lamports: u64,
     pub transactions: Vec<TxSimulation>,
+}
+
+/// A decoded, assembled-but-UNSENT swap-mode bundle (the dry run). tx0 is the
+/// signed Jupiter swap; tx1 is our tip. Proves the live Jupiter tx signs and (if
+/// simulated) would execute, before any real submission.
+#[derive(Debug, Clone)]
+pub struct SwapDryRun {
+    /// tx0 transaction version ("legacy" | "v0" | "versioned").
+    pub tx0_version: String,
+    /// Whether tx0's first signature is present (non-default).
+    pub tx0_signed: bool,
+    /// tx0's (swap) signature.
+    pub tx0_signature: String,
+    /// Number of static account keys in tx0.
+    pub tx0_num_accounts: usize,
+    /// tx0's blockhash (Jupiter's own — NOT ours).
+    pub tx0_blockhash: String,
+    /// Jito tip account tx1 pays.
+    pub tip_account: String,
+    /// Tip amount (lamports) in tx1.
+    pub tip_lamports: u64,
+    /// tx1's signature.
+    pub tip_signature: String,
+    /// tx1's blockhash (our fresh blockhash).
+    pub tip_blockhash: String,
+    /// Confirms the two transactions do NOT share a blockhash.
+    pub blockhashes_differ: bool,
+    /// The two base64 transactions, in bundle order [swap, tip].
+    pub tx0_base64: String,
+    pub tip_base64: String,
+    /// Simulation of tx0 (the swap) against RPC, if requested.
+    pub tx0_simulation: Option<SimulationResult>,
 }
 
 /// Jito's authoritative status for a submitted bundle, from
@@ -838,11 +888,15 @@ impl BundleGateway for LiveGateway {
         // our EXACT signed bytes against OUR real blockhash — so a stale blockhash
         // surfaces as BlockhashNotFound and a bad signature as a sig-verify error,
         // instead of being masked. This is what a validator/Jito actually sees.
+        // `maxSupportedTransactionVersion: 0` so a v0 transaction (e.g. a Jupiter
+        // swap with address lookup tables) simulates instead of erroring; harmless
+        // for the legacy memo/tip txs.
         let config = serde_json::json!({
             "sigVerify": true,
             "replaceRecentBlockhash": false,
             "commitment": "confirmed",
             "encoding": "base64",
+            "maxSupportedTransactionVersion": 0,
         });
         let response: Response<RpcSimulateTransactionResult> = self
             .rpc
@@ -932,15 +986,14 @@ fn compute_unit_limit_instruction(units: u32) -> Instruction {
     }
 }
 
-/// The constructed, signed pair plus their wire encodings.
+/// The constructed, signed memo+tip pair plus their wire encodings. The
+/// submission path builds the two txs directly via [`build_payload_tx`] /
+/// [`build_tip_tx`]; this aggregate exists only for the construction tests, which
+/// inspect the typed transactions.
+#[cfg(test)]
 struct BuiltBundle {
-    // Retained for offline test inspection; `submit` only sends the encodings.
-    #[allow(dead_code)]
     memo_tx: Transaction,
-    #[allow(dead_code)]
     tip_tx: Transaction,
-    memo_signature: String,
-    tip_signature: String,
     memo_base64: String,
     tip_base64: String,
 }
@@ -960,6 +1013,7 @@ struct BuiltBundle {
 /// prepended to tx1 so the bundle pays a priority fee with a pinned CU
 /// denominator — competing in a BAM leader's `(tips + priority_fees) / CU`
 /// auction. `0` priority fee adds nothing (unchanged).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // cohesive bundle-construction inputs; a struct would just move the noise
 fn build_bundle(
     keypair: &Keypair,
@@ -971,11 +1025,46 @@ fn build_bundle(
     tip_account: &Pubkey,
     blockhash: Hash,
 ) -> anyhow::Result<BuiltBundle> {
-    let payer = keypair.pubkey();
+    let payload: PayloadTx = build_payload_tx(
+        keypair,
+        memo,
+        self_transfer_lamports,
+        priority_fee_microlamports,
+        priority_fee_cu_limit,
+        blockhash,
+    )?;
+    let (tip_tx, _tip_signature, tip_base64) =
+        build_tip_tx(keypair, tip_lamports, tip_account, blockhash)?;
+    Ok(BuiltBundle {
+        memo_base64: payload.base64,
+        tip_base64,
+        memo_tx: payload.tx,
+        tip_tx,
+    })
+}
 
-    // tx1: [optional CU limit] + [optional priority fee] + memo (tracking marker)
-    // + self-transfer (real economic content). The compute-budget instructions go
-    // first, per convention (limit before price).
+/// A built, signed payload transaction with its signature and wire encoding.
+struct PayloadTx {
+    /// The typed transaction — only inspected by the construction tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    tx: Transaction,
+    signature: String,
+    base64: String,
+}
+
+/// Build the memo+self-transfer payload tx (the memo-mode tx0): `[optional CU
+/// limit] + [optional priority fee] + memo (tracking marker) + self-transfer
+/// (real economic content)`. The compute-budget instructions go first (limit
+/// before price). When `priority_fee_microlamports == 0` nothing is prepended.
+fn build_payload_tx(
+    keypair: &Keypair,
+    memo: &str,
+    self_transfer_lamports: u64,
+    priority_fee_microlamports: u64,
+    priority_fee_cu_limit: u32,
+    blockhash: Hash,
+) -> anyhow::Result<PayloadTx> {
+    let payer = keypair.pubkey();
     let self_transfer_ix =
         solana_system_interface::instruction::transfer(&payer, &payer, self_transfer_lamports);
     let mut payload_ixs = Vec::with_capacity(4);
@@ -989,22 +1078,60 @@ fn build_bundle(
     }
     payload_ixs.push(memo_instruction(memo));
     payload_ixs.push(self_transfer_ix);
-    let memo_tx =
-        Transaction::new_signed_with_payer(&payload_ixs, Some(&payer), &[keypair], blockhash);
+    let tx = Transaction::new_signed_with_payer(&payload_ixs, Some(&payer), &[keypair], blockhash);
+    let signature = tx.signatures[0].to_string();
+    let base64 = encode_tx(&tx)?;
+    Ok(PayloadTx {
+        tx,
+        signature,
+        base64,
+    })
+}
 
+/// Build the tip transfer tx (bundle tx1): `wallet -> tip_account` for
+/// `tip_lamports`, signed on `blockhash`. Returns the tx, its signature, and its
+/// wire encoding. Used by both payload modes.
+fn build_tip_tx(
+    keypair: &Keypair,
+    tip_lamports: u64,
+    tip_account: &Pubkey,
+    blockhash: Hash,
+) -> anyhow::Result<(Transaction, String, String)> {
+    let payer = keypair.pubkey();
     let transfer_ix =
         solana_system_interface::instruction::transfer(&payer, tip_account, tip_lamports);
-    let tip_tx =
-        Transaction::new_signed_with_payer(&[transfer_ix], Some(&payer), &[keypair], blockhash);
+    let tx = Transaction::new_signed_with_payer(&[transfer_ix], Some(&payer), &[keypair], blockhash);
+    let signature = tx.signatures[0].to_string();
+    let base64 = encode_tx(&tx)?;
+    Ok((tx, signature, base64))
+}
 
-    Ok(BuiltBundle {
-        memo_signature: memo_tx.signatures[0].to_string(),
-        tip_signature: tip_tx.signatures[0].to_string(),
-        memo_base64: encode_tx(&memo_tx)?,
-        tip_base64: encode_tx(&tip_tx)?,
-        memo_tx,
-        tip_tx,
-    })
+/// Sign a base64 Jupiter swap `VersionedTransaction` AS-IS (the swap-mode tx0).
+/// We never decompose or re-anchor it — Jupiter built it with its own blockhash
+/// and address lookup tables, and the wallet is its sole required signer. Returns
+/// the signed transaction's base64 encoding and its base58 signature.
+fn sign_swap_transaction(
+    keypair: &Keypair,
+    swap_tx_base64: &str,
+) -> anyhow::Result<(String, String)> {
+    let bytes = BASE64
+        .decode(swap_tx_base64)
+        .map_err(|e| anyhow::anyhow!("swap tx base64 decode: {e}"))?;
+    let tx: VersionedTransaction =
+        bincode::deserialize(&bytes).map_err(|e| anyhow::anyhow!("swap tx bincode decode: {e}"))?;
+    // `try_new` signs the (unchanged) message with our keypair and validates the
+    // signer set — it errors if the wallet is not the expected signer.
+    let signed = VersionedTransaction::try_new(tx.message, &[keypair])
+        .map_err(|e| anyhow::anyhow!("swap tx sign: {e}"))?;
+    let signature = signed
+        .signatures
+        .first()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("swap tx has no signature after signing"))?;
+    let base64 = BASE64.encode(
+        bincode::serialize(&signed).map_err(|e| anyhow::anyhow!("swap tx bincode encode: {e}"))?,
+    );
+    Ok((base64, signature))
 }
 
 /// bincode-serialize then base64-encode, as Jito's `sendBundle` expects.
@@ -1223,6 +1350,79 @@ fn log_bundle_diagnostic(
     }
 }
 
+/// Diagnostic for the swap-payload bundle (Path 2): tx0 is an opaque, signed
+/// Jupiter `VersionedTransaction` (its own blockhash + ALTs — we do NOT decode it
+/// into instructions), tx1 is our tip transfer (a legacy tx we DO verify). Logs
+/// tx0's version + signed state and self-audits the tip invariant on tx1.
+fn log_swap_bundle_diagnostic(
+    txs_base64: &[String],
+    expected_tip_account: &Pubkey,
+    expected_tip_lamports: u64,
+    expected_payer: &Pubkey,
+) {
+    debug!(
+        bundle_tx_count = txs_base64.len(),
+        expected_payer = %expected_payer,
+        expected_tip_account = %expected_tip_account,
+        expected_tip_lamports,
+        "SWAP BUNDLE DIAGNOSTIC: tx0 = signed Jupiter swap, tx1 = tip (independent blockhashes)"
+    );
+
+    // tx0: the swap VersionedTransaction. Confirm it deserializes and is signed.
+    match txs_base64.first().map(|b64| decode_versioned_tx(b64)) {
+        Some(Ok((version, num_sigs, num_keys))) => debug!(
+            tx_index = 0,
+            version,
+            num_signatures = num_sigs,
+            num_static_account_keys = num_keys,
+            signed = num_sigs > 0,
+            "SWAP BUNDLE DIAGNOSTIC: tx0 is a signed Jupiter swap VersionedTransaction"
+        ),
+        Some(Err(err)) => warn!(tx_index = 0, error = %err, "SWAP BUNDLE DIAGNOSTIC: tx0 swap tx failed to decode"),
+        None => warn!("SWAP BUNDLE DIAGNOSTIC: bundle has no tx0"),
+    }
+
+    // tx1: the tip transfer — verify the Jito tip invariant on it alone.
+    let tip_ok = txs_base64
+        .get(1)
+        .map(|tip_b64| {
+            bundle_has_valid_tip(
+                std::slice::from_ref(tip_b64),
+                expected_tip_account,
+                expected_tip_lamports,
+                expected_payer,
+            )
+        })
+        .unwrap_or(false);
+    if tip_ok {
+        debug!("SWAP BUNDLE DIAGNOSTIC: OK — tx1 carries a valid tip transfer (wallet -> tip account, exact amount, >= Jito minimum)");
+    } else {
+        warn!(
+            expected_payer = %expected_payer,
+            expected_tip_account = %expected_tip_account,
+            expected_tip_lamports,
+            "SWAP BUNDLE DIAGNOSTIC: tx1 has NO valid tip transfer — Jito will accept but never schedule the bundle"
+        );
+    }
+}
+
+/// Decode a base64 `VersionedTransaction`, returning (version, num_signatures,
+/// num_static_account_keys). Never panics.
+fn decode_versioned_tx(tx_base64: &str) -> anyhow::Result<(&'static str, usize, usize)> {
+    let bytes = BASE64
+        .decode(tx_base64)
+        .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
+    let tx: VersionedTransaction =
+        bincode::deserialize(&bytes).map_err(|e| anyhow::anyhow!("bincode decode failed: {e}"))?;
+    let version = match tx.message {
+        solana_sdk::message::VersionedMessage::Legacy(_) => "legacy",
+        solana_sdk::message::VersionedMessage::V0(_) => "v0",
+        _ => "versioned",
+    };
+    let num_keys = tx.message.static_account_keys().len();
+    Ok((version, tx.signatures.len(), num_keys))
+}
+
 /// Parse the `sendBundle` JSON-RPC response into a bundle id, mapping a
 /// JSON-RPC `error` to [`SubmitError::Rejected`].
 fn parse_send_response(response: &serde_json::Value) -> Result<String, SubmitError> {
@@ -1346,21 +1546,31 @@ impl<G: BundleGateway> BundleSubmitter<G> {
             tip_lamports = prep.tip_lamports,
             tip_account = %prep.tip_account_str,
             blockhash = %prep.blockhash,
-            memo_signature = %prep.built.memo_signature,
+            tracking_signature = %prep.tracking_signature,
+            payload = if prep.is_swap { "swap" } else { "memo" },
             fault = ?prep.fault_injected,
             prepare_ms,
             "constructed bundle (prepare = fetch blockhash + fetch tip account + build + sign)"
         );
 
         // 5. Diagnostic: decode the exact bytes we're about to send and verify the
-        // tip transfer is structurally a valid Jito tip. The tip tx is LAST.
-        let txs_base64 = vec![prep.built.memo_base64, prep.built.tip_base64];
-        log_bundle_diagnostic(
-            &txs_base64,
-            &prep.tip_account,
-            prep.tip_lamports,
-            &self.keypair.pubkey(),
-        );
+        // tip transfer is a valid Jito tip. tx1 (LAST) is the tip in both modes.
+        let txs_base64 = vec![prep.tx0_base64, prep.tx1_base64];
+        if prep.is_swap {
+            log_swap_bundle_diagnostic(
+                &txs_base64,
+                &prep.tip_account,
+                prep.tip_lamports,
+                &self.keypair.pubkey(),
+            );
+        } else {
+            log_bundle_diagnostic(
+                &txs_base64,
+                &prep.tip_account,
+                prep.tip_lamports,
+                &self.keypair.pubkey(),
+            );
+        }
 
         // 5b. Debug-gated pre-submission simulation (SIMULATE_BEFORE_SEND=1): a
         // tx that aborts in simulation would silently drop the whole atomic bundle.
@@ -1395,8 +1605,10 @@ impl<G: BundleGateway> BundleSubmitter<G> {
                     bundle_id,
                     tip_lamports: prep.tip_lamports,
                     tip_account: prep.tip_account_str,
-                    memo_signature: prep.built.memo_signature,
-                    tip_signature: prep.built.tip_signature,
+                    // The tracking signature (tx0): memo sig in memo mode, swap sig
+                    // in swap mode — the lifecycle watches this on the stream.
+                    memo_signature: prep.tracking_signature,
+                    tip_signature: prep.tip_signature,
                     blockhash: prep.blockhash.to_string(),
                     blockhash_fetched_at_slot: current_slot,
                     submitted_at,
@@ -1455,21 +1667,44 @@ impl<G: BundleGateway> BundleSubmitter<G> {
             SubmitError::BadResponse(format!("invalid tip account '{tip_account_str}': {e}"))
         })?;
 
-        let memo = self.full_memo(&spec.memo_text);
-        let built = build_bundle(
-            &self.keypair,
-            &memo,
-            self.config.self_transfer_lamports,
-            spec.priority_fee_microlamports,
-            spec.priority_fee_cu_limit,
-            tip_lamports,
-            &tip_account,
-            blockhash,
-        )
-        .map_err(|e| SubmitError::BadResponse(format!("bundle construction failed: {e}")))?;
+        // tx1: the tip transfer on OUR cached blockhash (both payload modes).
+        let (tip_tx, tip_signature, tip_base64) =
+            build_tip_tx(&self.keypair, tip_lamports, &tip_account, blockhash)
+                .map_err(|e| SubmitError::BadResponse(format!("tip tx build failed: {e}")))?;
+        let _ = tip_tx; // retained only for clarity; only the encoding is sent.
+
+        // tx0: either the signed Jupiter swap (Path 2) or memo+self-transfer.
+        let (tx0_base64, tracking_signature, is_swap) = match &spec.swap_tx_base64 {
+            Some(swap_b64) => {
+                // Sign Jupiter's VersionedTransaction AS-IS — never decompose or
+                // re-anchor it; it carries its own blockhash + lookup tables.
+                let (signed_b64, sig) = sign_swap_transaction(&self.keypair, swap_b64)
+                    .map_err(|e| SubmitError::BadResponse(format!("swap tx sign failed: {e}")))?;
+                (signed_b64, sig, true)
+            }
+            None => {
+                let memo = self.full_memo(&spec.memo_text);
+                let payload = build_payload_tx(
+                    &self.keypair,
+                    &memo,
+                    self.config.self_transfer_lamports,
+                    spec.priority_fee_microlamports,
+                    spec.priority_fee_cu_limit,
+                    blockhash,
+                )
+                .map_err(|e| {
+                    SubmitError::BadResponse(format!("bundle construction failed: {e}"))
+                })?;
+                (payload.base64, payload.signature, false)
+            }
+        };
 
         Ok(Prepared {
-            built,
+            tx0_base64,
+            tx1_base64: tip_base64,
+            tracking_signature,
+            tip_signature,
+            is_swap,
             tip_account,
             tip_account_str,
             tip_lamports,
@@ -1507,6 +1742,87 @@ impl<G: BundleGateway> BundleSubmitter<G> {
             .map_err(|e| SubmitError::Transport(format!("get_latest_blockhash: {e}")))
     }
 
+    /// Swap-mode DRY RUN — proves the live Jupiter swap tx signs and (optionally)
+    /// would execute, WITHOUT submitting. Signs `swap_tx_base64` as tx0, fetches a
+    /// fresh blockhash + real Jito tip account and builds the tip tx1, decodes
+    /// both, and (if `simulate`) runs `simulateTransaction` on tx0. Never calls
+    /// `sendBundle`.
+    pub async fn dry_run_swap_bundle(
+        &self,
+        swap_tx_base64: &str,
+        tip_lamports: u64,
+        current_slot: u64,
+        simulate: bool,
+    ) -> Result<SwapDryRun, SubmitError> {
+        // tx0: sign the Jupiter swap as-is, then decode it for the report.
+        let (tx0_base64, tx0_signature) = sign_swap_transaction(&self.keypair, swap_tx_base64)
+            .map_err(|e| SubmitError::BadResponse(format!("swap tx sign failed: {e}")))?;
+        let tx0_bytes = BASE64
+            .decode(&tx0_base64)
+            .map_err(|e| SubmitError::BadResponse(format!("tx0 base64 decode: {e}")))?;
+        let tx0: VersionedTransaction = bincode::deserialize(&tx0_bytes)
+            .map_err(|e| SubmitError::BadResponse(format!("tx0 decode: {e}")))?;
+        let tx0_version = match tx0.message {
+            solana_sdk::message::VersionedMessage::Legacy(_) => "legacy",
+            solana_sdk::message::VersionedMessage::V0(_) => "v0",
+            _ => "versioned",
+        }
+        .to_string();
+        let tx0_signed = tx0
+            .signatures
+            .first()
+            .map(|s| *s != solana_sdk::signature::Signature::default())
+            .unwrap_or(false);
+        let tx0_num_accounts = tx0.message.static_account_keys().len();
+        let tx0_blockhash = tx0.message.recent_blockhash().to_string();
+
+        // tx1: tip transfer on OUR fresh blockhash + a real Jito tip account.
+        let tip_blockhash = self.resolve_blockhash(false, current_slot).await?;
+        let tip_account_str = self
+            .gateway
+            .random_tip_account()
+            .await
+            .map_err(|e| SubmitError::Transport(format!("random_tip_account: {e}")))?;
+        let tip_account = Pubkey::from_str(&tip_account_str).map_err(|e| {
+            SubmitError::BadResponse(format!("invalid tip account '{tip_account_str}': {e}"))
+        })?;
+        let (_tip_tx, tip_signature, tip_base64) =
+            build_tip_tx(&self.keypair, tip_lamports, &tip_account, tip_blockhash)
+                .map_err(|e| SubmitError::BadResponse(format!("tip tx build failed: {e}")))?;
+
+        let tip_blockhash_str = tip_blockhash.to_string();
+        let blockhashes_differ = tx0_blockhash != tip_blockhash_str;
+
+        // Optional: simulate tx0 (the swap) faithfully — sigVerify on, no blockhash
+        // replacement. Does NOT submit.
+        let tx0_simulation = if simulate {
+            Some(
+                self.gateway
+                    .simulate_transaction(&tx0_base64)
+                    .await
+                    .map_err(|e| SubmitError::Transport(format!("simulate swap tx: {e}")))?,
+            )
+        } else {
+            None
+        };
+
+        Ok(SwapDryRun {
+            tx0_version,
+            tx0_signed,
+            tx0_signature,
+            tx0_num_accounts,
+            tx0_blockhash,
+            tip_account: tip_account_str,
+            tip_lamports,
+            tip_signature,
+            tip_blockhash: tip_blockhash_str,
+            blockhashes_differ,
+            tx0_base64,
+            tip_base64,
+            tx0_simulation,
+        })
+    }
+
     /// Build the bundle exactly as [`submit`](Self::submit) would, but simulate
     /// each transaction individually against the RPC instead of sending — the
     /// definitive "would this bundle abort in Jito's atomic simulation?" probe.
@@ -1516,12 +1832,12 @@ impl<G: BundleGateway> BundleSubmitter<G> {
         current_slot: u64,
     ) -> Result<BundleSimulation, SubmitError> {
         let prep = self.prepare(&spec, current_slot).await?;
-        let labels = ["memo+self-transfer", "tip-transfer"];
-        let signatures = [
-            prep.built.memo_signature.clone(),
-            prep.built.tip_signature.clone(),
+        let labels = [
+            if prep.is_swap { "swap" } else { "memo+self-transfer" },
+            "tip-transfer",
         ];
-        let txs = [prep.built.memo_base64, prep.built.tip_base64];
+        let signatures = [prep.tracking_signature.clone(), prep.tip_signature.clone()];
+        let txs = [prep.tx0_base64, prep.tx1_base64];
 
         let mut transactions = Vec::with_capacity(txs.len());
         for (i, b64) in txs.iter().enumerate() {
@@ -1576,12 +1892,26 @@ impl<G: BundleGateway> BundleSubmitter<G> {
     }
 }
 
-/// Built bundle + the metadata needed to send or simulate it.
+/// Built bundle + the metadata needed to send or simulate it. The two
+/// transactions are carried as independent base64 encodings — tx0 (memo+self-
+/// transfer or signed Jupiter swap) and tx1 (tip) — which do NOT share a
+/// blockhash in swap mode.
 struct Prepared {
-    built: BuiltBundle,
+    /// Bundle tx0: memo+self-transfer (memo mode) or the signed Jupiter swap
+    /// (swap mode). Base64, ready to send.
+    tx0_base64: String,
+    /// Bundle tx1: the tip transfer (our cached blockhash). Base64.
+    tx1_base64: String,
+    /// Signature of tx0 — the lifecycle tracking signature (memo sig or swap sig).
+    tracking_signature: String,
+    /// Signature of the tip tx.
+    tip_signature: String,
+    /// Whether tx0 is a Jupiter swap (vs the memo+self-transfer payload).
+    is_swap: bool,
     tip_account: Pubkey,
     tip_account_str: String,
     tip_lamports: u64,
+    /// Our (tip tx) blockhash.
     blockhash: Hash,
     fault_injected: Option<String>,
 }
@@ -1701,6 +2031,56 @@ mod tests {
         assert_eq!(tx0.instructions.len(), 3);
         assert_eq!(tx0.instructions[0].program_id, compute_budget_program_id());
         assert_eq!(tx0.instructions[0].data_len, 9); // price only
+    }
+
+    // --- swap payload (Path 2) ---
+
+    #[test]
+    fn swap_payload_signs_jupiter_tx_and_assembles_independent_bundle() {
+        use solana_sdk::message::{Message, VersionedMessage};
+        use solana_sdk::signature::Signature;
+
+        let wallet = Keypair::new();
+        let tip_account = Pubkey::new_unique();
+        let our_blockhash = Hash::new_unique();
+        let jupiter_blockhash = Hash::new_unique(); // Jupiter's OWN blockhash, different from ours
+
+        // Stand in for Jupiter's UNSIGNED swap VersionedTransaction: wallet is the
+        // sole required signer, anchored on Jupiter's blockhash (not ours).
+        let mut msg = Message::new(&[memo_instruction("swap")], Some(&wallet.pubkey()));
+        msg.recent_blockhash = jupiter_blockhash;
+        let unsigned = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::Legacy(msg),
+        };
+        let jupiter_b64 = BASE64.encode(bincode::serialize(&unsigned).unwrap());
+
+        // Sign it as-is (Path 2: never decompose/re-anchor).
+        let (signed_b64, sig) = sign_swap_transaction(&wallet, &jupiter_b64).unwrap();
+        let signed: VersionedTransaction =
+            bincode::deserialize(&BASE64.decode(&signed_b64).unwrap()).unwrap();
+        assert_eq!(signed.signatures.len(), 1);
+        assert_ne!(signed.signatures[0], Signature::default(), "tx0 must be signed");
+        assert_eq!(signed.signatures[0].to_string(), sig, "tracking sig == swap sig");
+        assert!(signed.verify_with_results().iter().all(|&ok| ok), "signature valid");
+        // tx0 keeps Jupiter's blockhash — we did NOT re-anchor it on ours.
+        assert_eq!(*signed.message.recent_blockhash(), jupiter_blockhash);
+
+        // tx1: our tip on OUR blockhash — independent of tx0.
+        let (_tip_tx, _tip_sig, tip_b64) =
+            build_tip_tx(&wallet, 5_000, &tip_account, our_blockhash).unwrap();
+
+        // Bundle assembles as [swap_tx, tip_tx], each encoded independently.
+        let bundle = [signed_b64, tip_b64];
+        // tx0 decodes as a signed VersionedTransaction.
+        let (version, num_sigs, _) = decode_versioned_tx(&bundle[0]).unwrap();
+        assert_eq!(version, "legacy");
+        assert_eq!(num_sigs, 1);
+        // tx1 carries the valid Jito tip, and the two blockhashes differ.
+        assert!(bundle_has_valid_tip(&[bundle[1].clone()], &tip_account, 5_000, &wallet.pubkey()));
+        let tip_decoded = decode_bundle_tx(&bundle[1]).unwrap();
+        assert_eq!(tip_decoded.recent_blockhash, our_blockhash);
+        assert_ne!(tip_decoded.recent_blockhash, jupiter_blockhash, "no shared blockhash");
     }
 
     // --- pure construction ---
@@ -2180,6 +2560,7 @@ mod tests {
             memo_text: memo.to_string(),
             priority_fee_microlamports: 0,
             priority_fee_cu_limit: 0,
+            swap_tx_base64: None,
             #[cfg(feature = "fault-injection")]
             fault: None,
         }
@@ -2271,6 +2652,7 @@ mod tests {
             memo_text: "x".to_string(),
             priority_fee_microlamports: 0,
             priority_fee_cu_limit: 0,
+            swap_tx_base64: None,
             fault: Some(Fault::SubFloorTip { lamports: 500 }),
         };
         let record = submitter.submit(spec, 7).await.unwrap();
@@ -2297,6 +2679,7 @@ mod tests {
             memo_text: "x".to_string(),
             priority_fee_microlamports: 0,
             priority_fee_cu_limit: 0,
+            swap_tx_base64: None,
             fault: Some(Fault::StaleBlockhash { age_slots: 100 }),
         };
         let record = submitter.submit(spec, 9).await.unwrap();

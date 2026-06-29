@@ -60,6 +60,22 @@ pub struct Config {
     pub drain_timeout: Duration,
     /// Which landed-tip percentile the normal-submission tip policy targets.
     pub tip_percentile: crate::app::TipPercentile,
+    /// Bundle payload mode: `Memo` (memo + self-transfer, default) or `Swap` (a
+    /// real Jupiter swap as tx0). `PAYLOAD`.
+    pub payload: crate::app::PayloadKind,
+    /// Swap-mode input mint (default wrapped SOL). `SWAP_INPUT_MINT`.
+    pub swap_input_mint: String,
+    /// Swap-mode output mint (default USDC). `SWAP_OUTPUT_MINT`.
+    pub swap_output_mint: String,
+    /// Swap-mode input amount in lamports/base units (default 10_000_000 = 0.01
+    /// SOL). `SWAP_AMOUNT_LAMPORTS`.
+    pub swap_amount_lamports: u64,
+    /// Swap-mode slippage tolerance in basis points (default 50). `SWAP_SLIPPAGE_BPS`.
+    pub swap_slippage_bps: u16,
+    /// How many slots ahead of the target Jito leader the swap-mode window fires
+    /// (the leader-tracker threshold in swap mode), giving runway for submission.
+    /// Default 2. `SWAP_LEAD_SLOTS`.
+    pub swap_lead_slots: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -102,6 +118,12 @@ impl std::fmt::Debug for Config {
             .field("max_attempts", &self.max_attempts)
             .field("agent_model", &self.agent_model)
             .field("tip_percentile", &self.tip_percentile.as_str())
+            .field("payload", &self.payload.as_str())
+            .field("swap_input_mint", &self.swap_input_mint)
+            .field("swap_output_mint", &self.swap_output_mint)
+            .field("swap_amount_lamports", &self.swap_amount_lamports)
+            .field("swap_slippage_bps", &self.swap_slippage_bps)
+            .field("swap_lead_slots", &self.swap_lead_slots)
             .finish()
     }
 }
@@ -139,6 +161,16 @@ impl Config {
                     format!("invalid TIP_PERCENTILE {raw:?} (expected p50|p75|p95)")
                 })?
             },
+            payload: {
+                let raw = optional("PAYLOAD", "memo");
+                crate::app::PayloadKind::parse(&raw)
+                    .with_context(|| format!("invalid PAYLOAD {raw:?} (expected memo|swap)"))?
+            },
+            swap_input_mint: optional("SWAP_INPUT_MINT", submitter::jupiter::WSOL_MINT),
+            swap_output_mint: optional("SWAP_OUTPUT_MINT", submitter::jupiter::USDC_MINT),
+            swap_amount_lamports: parse_or("SWAP_AMOUNT_LAMPORTS", 10_000_000)?,
+            swap_slippage_bps: parse_or("SWAP_SLIPPAGE_BPS", 50)?,
+            swap_lead_slots: parse_or("SWAP_LEAD_SLOTS", 2)?,
         })
     }
 }

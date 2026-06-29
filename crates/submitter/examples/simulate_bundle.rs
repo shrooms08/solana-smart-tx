@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         memo_text: "simulate-probe".to_string(),
         priority_fee_microlamports: 0,
         priority_fee_cu_limit: 0,
+        swap_tx_base64: None,
         #[cfg(feature = "fault-injection")]
         fault: None,
     };
