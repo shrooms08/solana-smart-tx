@@ -68,3 +68,9 @@ low-latency authenticated submission, lifecycle tracking, failure
 classification, and the agent decision layer — is exactly what such a strategy
 would sit on top of. The hard part of a smart transaction stack is the
 machinery; the machinery is what this project built and verified.
+
+### What real content proved
+
+Real economic content was added to the bundle to test the auction directly. The payload became a genuine Jupiter swap of 0.01 SOL to USDC, signed as-is and paired with the tip transfer as two independent transactions. The swap was verified to simulate cleanly on-chain (sigVerify on, no blockhash replacement, ~106k compute units), and it was pre-fetched ahead of the leader window so it submitted with zero slot drift, matching the memo path's timing. With that real, executable content in place, the bundle still did not win its auction at any tip level tested, from p75 up to a 150,000 lamport ceiling (roughly p95 during volatile periods), across both Block Engine and BAM leaders.
+
+This sharpens the central finding. A real, executable transaction gets the bundle cleanly into the auction, but entering is not winning. Winning requires the bundle's own economic value to fund a competitive tip, and a fixed-size swap of one's own capital generates no profit, so it cannot out-bid the arbitrage and swap flow that pays its tips out of realized gains. The infrastructure built here, live swap integration, leader-agnostic pre-fetch, dynamic tip pricing, and authenticated submission, is exactly what a profit-generating strategy would sit on top of. What this project demonstrates is the complete machinery and a precise, measured account of the one thing that remains: the bundle must be worth more to the block than it costs to include.
